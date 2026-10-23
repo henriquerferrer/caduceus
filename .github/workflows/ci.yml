@@ -1,0 +1,226 @@
+name: CI
+
+# Scaffolded by sweap's /agentic-loop-init (copy-generalized from the
+# agentic-ci convention). Job names (lint, typecheck, test, e2e) and the
+# ci-status JSON convention (see CLAUDE.md's CI section) are the contract the
+# rest of the pipeline reads — keep them stable. Every step marked
+# "<fill in for your stack>" is stack-specific and must be completed before
+# this workflow will pass.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  NO_COLOR: "1"
+  FORCE_COLOR: "0"
+  CI: "true"
+
+jobs:
+  # Which lane is this change in? `roadmap-only` (backlog files, docs, markdown —
+  # nothing e2e tests) lets the e2e job skip; anything else, and any uncertainty,
+  # is `code` and runs everything. Classified by the VENDORED
+  # .github/scripts/ci-lane.sh — the same script pre-merge-gate.sh runs on the
+  # PR's own file list before it accepts a skipped e2e as green, so the lane CI
+  # took and the lane the merge gate accepts cannot drift apart. Allowlist and
+  # fail-closed by construction (see the script's header).
+  #
+  # WHY: a captured backlog item that costs two e2e runs (PR + post-merge push)
+  # is what drives agents to bundle backlog files onto unrelated feature
+  # branches. The playbook's rule against that holds only while the sanctioned
+  # path is the cheap one. (Research memo, 2026-08-22.)
+  #
+  # NEVER gate lint, typecheck, test or audit-gate on this output — a job
+  # skipped by an `if:` reports SUCCESS, and the merge gate denies a PR where
+  # any of those is SKIPPED. Only e2e is allowed to skip, and only on this lane.
+  changes:
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    # The `tested` lane (below) asks GitHub which PR a pushed commit came from and
+    # whether e2e passed on its head. Under the workflow-level `contents: read`
+    # both calls 403 and the lane is silently always `code`.
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    outputs:
+      lane: ${{ steps.lane.outputs.lane }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
+        with:
+          fetch-depth: 0 # the lane is a diff against the base; a shallow clone can't compute it
+      - id: lane
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          GH_TOKEN: ${{ github.token }} # step-scoped; read by `ci-lane.sh --tested-tree` only
+        run: |
+          set -euo pipefail
+          LANE=.github/scripts/ci-lane.sh
+          if [ ! -f "$LANE" ]; then
+            echo "::warning::$LANE is missing (sweap's scaffold vendors it) — running the full lane"
+            echo "lane=code" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ -n "${BASE_REF:-}" ]; then
+            git fetch -q --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+            lane="$(bash "$LANE" --base "origin/${BASE_REF}")"
+          elif [ -n "${PUSH_BEFORE:-}" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            # push to main: classify the WHOLE push — every commit it carried.
+            #
+            # NOT HEAD^. A push can land several commits at once, and HEAD^ sees
+            # only the tip, so a code commit earlier in the same push is
+            # invisible to the classifier. A consumer, 2026-08-30: a human pushed a
+            # ci.yml edit (892147d, which rewrote the e2e job's runner labels and
+            # timeout) together with its roadmap update (5964666). HEAD^ saw only
+            # the roadmap file, the lane came out `roadmap-only`, and e2e skipped
+            # the very job the first commit had just changed.
+            #
+            # A squash merge is one commit, so this is identical to HEAD^ on the
+            # agent path (sweap-merge.sh always merges --squash). It differs only
+            # on the multi-commit pushes a HUMAN makes — which is exactly the
+            # sanctioned path for CI changes, since the merge gate denies those
+            # PRs to sessions and hands them to a human.
+            #
+            # github.event.before is "the SHA of the most recent commit on ref
+            # before the push". After a force push it can name a commit this
+            # clone does not have; ci-lane.sh's `git merge-base` guard turns any
+            # unresolvable base into `code`, so that fails closed too.
+            lane="$(bash "$LANE" --base "$PUSH_BEFORE")"
+            # The `tested` lane — PUSH EVENTS ONLY, so a pull request can never
+            # reach it. After a squash merge this run would re-test a tree the PR
+            # run has just passed; ci-lane.sh says `tested` only when the pushed
+            # tree IS that PR head's tree, main's previous tip was its ancestor,
+            # and e2e is green on it (its header lists every condition). A direct
+            # human push, a push touching .github/, or ANY doubt stays `code`.
+            # `|| true` and the equality test are load-bearing: an OLDER vendored
+            # ci-lane.sh exits 2 on the unknown flag, and under `set -e` that would
+            # fail this job and turn every push to main red.
+            if [ "$lane" = "code" ]; then
+              tested="$(bash "$LANE" --tested-tree "$PUSH_BEFORE" 2>"$RUNNER_TEMP/tested-tree.txt" || true)"
+              if [ -s "$RUNNER_TEMP/tested-tree.txt" ]; then echo "::notice::$(head -1 "$RUNNER_TEMP/tested-tree.txt")"; fi
+              if [ "$tested" = "tested" ]; then lane=tested; fi
+            fi
+          else
+            # No usable before-sha (a push that CREATES the branch sends
+            # all-zeros). Uncertainty runs the suite, never skips it.
+            lane=code
+          fi
+          echo "lane: $lane"
+          echo "lane=$lane" >> "$GITHUB_OUTPUT"
+
+  lint:
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - run: just lint
+      - if: always()
+        run: bash .github/scripts/ci-status.sh lint ${{ job.status }} >> "$GITHUB_STEP_SUMMARY"
+
+  typecheck:
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - run: just typecheck
+      - if: always()
+        run: bash .github/scripts/ci-status.sh typecheck ${{ job.status }} >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - run: just test
+      - if: always()
+        run: bash .github/scripts/ci-status.sh test ${{ job.status }} >> "$GITHUB_STEP_SUMMARY"
+
+  e2e:
+    needs: [changes]
+    # Skips ONLY on the roadmap-only lane, or — on a push — the `tested` lane (see
+    # `changes`). `!cancelled()` rather than the implicit success() so a failed
+    # `changes` job (empty output) still runs e2e — uncertainty runs the suite,
+    # never skips it.
+    if: ${{ !cancelled() && needs.changes.outputs.lane != 'roadmap-only' && needs.changes.outputs.lane != 'tested' }}
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Install e2e prerequisites
+        run: npm ci --prefix e2e/twilio-node --no-audit --no-fund
+      - run: just e2e
+      - if: always()
+        run: bash .github/scripts/ci-status.sh e2e ${{ job.status }} >> "$GITHUB_STEP_SUMMARY"
+
+  ci-status:
+    needs: [changes, lint, typecheck, test, e2e]
+    # `if: always()` so this job exists (and can fail) whatever happened above —
+    # it is the aggregator whose PRESENCE the merge gate requires. Skipped is
+    # NOT a pass here: every gate must be `success`, except e2e, which may be
+    # `skipped` only when the `changes` job classified this change `roadmap-only`
+    # or (push events only) `tested`
+    # (a needs-result of `skipped` for any other reason — a mis-globbed `if:`,
+    # a failed dependency — fails this job, because a job skipped by an `if:`
+    # reports SUCCESS to required checks; audit-gate.yml's first hard rule).
+    if: always()
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read # ci-summary.sh lists this run's jobs
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
+      - run: bash .github/scripts/ci-summary.sh >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Fail unless every gate succeeded (e2e may skip only on the roadmap-only or tested lane)
+        if: >-
+          contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+          || needs.lint.result != 'success'
+          || needs.typecheck.result != 'success'
+          || needs.test.result != 'success'
+          || (needs.e2e.result != 'success' && !(needs.e2e.result == 'skipped' && (needs.changes.outputs.lane == 'roadmap-only' || needs.changes.outputs.lane == 'tested')))
+        run: exit 1

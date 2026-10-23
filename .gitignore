@@ -1,1 +1,7 @@
 /bin/
+.claude/main-red-*.flag
+.claude/sweap-board.md
+.claude/sweap-run.md
+.claude/audit-debt-*.flag
+.claude/sweap-merge/
+node_modules/

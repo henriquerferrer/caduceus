@@ -1,0 +1,36 @@
+{
+  "enabledPlugins": {
+    "sweap@sweap": true
+  },
+  "env": {
+    "CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP": "1"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(gh pr view:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh run view:*)",
+      "Bash(gh run list:*)",
+      "Bash(just:*)",
+      "Bash(go test:*)",
+      "Bash(go vet:*)",
+      "Bash(go build:*)",
+      "Bash(sweap-merge:*)",
+      "Bash(sweap-roadmap-lint:*)",
+      "Bash(sweap-stranded:*)",
+      "Bash(sweap-note:*)"
+    ]
+  },
+  "extraKnownMarketplaces": {
+    "sweap": {
+      "source": {
+        "source": "github",
+        "repo": "henriquerferrer/sweap"
+      },
+      "autoUpdate": true
+    }
+  }
+}
