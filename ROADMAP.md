@@ -12,7 +12,8 @@ the item files; this index never carries per-item status. Dropped items move to
 
 ## Milestones (priority order)
 
-- F1 — Twilio Verify emulation: start/check verification in-process, codes land in the inbox (not yet specced — run `/roadmap`)
+- F1 — Twilio Verify emulation: an unmodified app's Verify start/check is answered by Caduceus on `verify.twilio.com`, and every channel's code lands in the inbox (items `roadmap/F1.1.md`–`F1.6.md`).
+  Success signal: an app's unchanged Verify sign-up test passes against Caduceus, reading the code from `/api/v1/wait`, and repeated wrong codes reach Twilio's real max-attempts error.
 
 ## Later milestones (sketch, not yet specced)
 
