@@ -146,3 +146,23 @@ func TestTwilioNodeSDK(t *testing.T) {
 		t.Fatalf("otp = %v, want 771204", got)
 	}
 }
+
+// The inbox UI in a real browser: the Playwright specs in ui/ run against the
+// built binary.
+func TestInboxUI(t *testing.T) {
+	if _, err := os.Stat("ui/node_modules/@playwright/test"); err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatal("the ui fixture is not installed; run just e2e, or npm ci and npx playwright install chromium in e2e/ui")
+		}
+		t.Skip("run `just e2e`, or `npm ci` and `npx playwright install chromium` in e2e/ui, to enable")
+	}
+	c := start(t)
+	cmd := exec.Command("npx", "--no-install", "playwright", "test")
+	cmd.Dir = "ui"
+	cmd.Env = append(os.Environ(), "CADUCEUS_URL="+c.base)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("playwright test: %v\n%s", err, out)
+	}
+	t.Logf("%s", out)
+}
