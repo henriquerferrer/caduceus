@@ -46,8 +46,10 @@ type Server struct {
 	// of their host's routes go to the real provider.
 	messaging *http.ServeMux
 	verify    *http.ServeMux
-	// verifyMu serialises every Verify read-modify-write, so concurrent
-	// requests never create two pending verifications or lose an attempt.
+	// verifyMu serialises every Verify read-modify-write, and the inbox
+	// clear that deletes verifications, so concurrent requests never create
+	// two pending verifications, lose an attempt or lose their verification
+	// between its read and its write.
 	verifyMu sync.Mutex
 	upstream *httputil.ReverseProxy
 	// direct reaches real servers for proxied traffic Caduceus doesn't capture.
@@ -180,6 +182,16 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 // capture stores an outbound message and starts its simulated delivery. The
 // OTP is read from the body unless m already carries one.
 func (s *Server) capture(m store.Message) (store.Message, error) {
+	m, err := s.store.Add(outbound(m))
+	if err != nil {
+		return m, err
+	}
+	s.captured(m)
+	return m, nil
+}
+
+// outbound fills in what capture sets on a message before it is stored.
+func outbound(m store.Message) store.Message {
 	m.ID = store.NewSID("SM")
 	m.Direction = store.Outbound
 	m.Status = "queued"
@@ -187,15 +199,15 @@ func (s *Server) capture(m store.Message) (store.Message, error) {
 		m.OTP = sms.ExtractOTP(m.Body)
 	}
 	m.Encoding, m.Segments = sms.Segments(m.Body)
-	m, err := s.store.Add(m)
-	if err != nil {
-		return m, err
-	}
+	return m
+}
+
+// captured logs a stored outbound message and starts its simulated delivery.
+func (s *Server) captured(m store.Message) {
 	s.log.Info("captured", "provider", m.Provider, "to", m.To, "id", m.ID)
 	if s.opts.DeliveryDelay >= 0 {
 		go s.simulateDelivery(m.ID)
 	}
-	return m, nil
 }
 
 func (s *Server) simulateDelivery(id string) {
@@ -306,6 +318,10 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleClear(w http.ResponseWriter, r *http.Request) {
+	// Clear deletes verifications too, so it is a Verify mutation: it must not
+	// land between a Verify handler's read and its write.
+	s.verifyMu.Lock()
+	defer s.verifyMu.Unlock()
 	if err := s.store.Clear(); err != nil {
 		s.fail(w, err)
 		return

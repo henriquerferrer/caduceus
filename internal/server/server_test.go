@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -618,6 +620,96 @@ func TestVerifyConcurrentSends(t *testing.T) {
 	vs, err := st.ListVerifications(store.Filter{To: to})
 	if err != nil || len(vs) != 1 || len(vs[0].SendAttempts) != 5 {
 		t.Fatalf("stored %+v, %v", vs, err)
+	}
+}
+
+// A send whose message cannot be stored changes nothing: no verification is
+// created, a reused one keeps its attempts and channel, and the error is
+// Twilio's 500 shape.
+func TestVerifySendFailureLeavesNoState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "caduceus.db")
+	st, err := store.Open(path, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	ts := httptest.NewServer(New(st, Options{}))
+	t.Cleanup(ts.Close)
+	// A second connection to the same file makes message inserts fail.
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	failMessages := func(on bool) {
+		t.Helper()
+		q := `DROP TRIGGER IF EXISTS fail_messages`
+		if on {
+			q = `CREATE TRIGGER fail_messages BEFORE INSERT ON messages BEGIN SELECT RAISE(FAIL, 'disk full'); END`
+		}
+		if _, err := db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantFailure := func(status int, body map[string]any) {
+		t.Helper()
+		if status != http.StatusInternalServerError || body["code"] != float64(20500) || body["status"] != float64(500) {
+			t.Fatalf("got %d %v, want 500 code 20500", status, body)
+		}
+	}
+
+	newTo, reusedTo := "+15550008881", "+15550008882"
+	failMessages(true)
+	wantFailure(startVerification(t, ts.URL, "VAx", url.Values{"To": {newTo}, "Channel": {"sms"}}))
+	if vs, err := st.ListVerifications(store.Filter{To: newTo}); err != nil || len(vs) != 0 {
+		t.Fatalf("failed send stored %+v, %v", vs, err)
+	}
+
+	failMessages(false)
+	if status, _ := startVerification(t, ts.URL, "VAx", url.Values{"To": {reusedTo}, "Channel": {"sms"}}); status != http.StatusCreated {
+		t.Fatalf("first send: %d", status)
+	}
+	failMessages(true)
+	wantFailure(startVerification(t, ts.URL, "VAx", url.Values{"To": {reusedTo}, "Channel": {"whatsapp"}}))
+	vs, err := st.ListVerifications(store.Filter{To: reusedTo})
+	if err != nil || len(vs) != 1 || len(vs[0].SendAttempts) != 1 || vs[0].Channel != "sms" {
+		t.Fatalf("after a failed resend: %+v, %v", vs, err)
+	}
+}
+
+// Clearing the inbox deletes verifications, so it waits for verifyMu like
+// every other Verify mutation: a send or update between its read and its
+// write never sees the verification vanish.
+func TestClearWaitsForVerifyMutations(t *testing.T) {
+	ts := newTestServer(t)
+	srv := ts.Config.Handler.(*Server)
+	srv.verifyMu.Lock()
+	done := make(chan int, 1)
+	go func() {
+		req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/messages", nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Error(err)
+			done <- 0
+			return
+		}
+		resp.Body.Close()
+		done <- resp.StatusCode
+	}()
+	select {
+	case status := <-done:
+		srv.verifyMu.Unlock()
+		t.Fatalf("clear finished (%d) while a Verify mutation held verifyMu", status)
+	case <-time.After(200 * time.Millisecond):
+	}
+	srv.verifyMu.Unlock()
+	select {
+	case status := <-done:
+		if status != http.StatusNoContent {
+			t.Fatalf("clear: %d", status)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("clear did not finish after verifyMu was released")
 	}
 }
 

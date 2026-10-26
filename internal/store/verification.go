@@ -80,6 +80,15 @@ func (s *Store) publishVerification(v Verification) {
 // to now and ExpiresAt to CreatedAt plus VerificationTTL, ignoring the values
 // passed in, and prunes the oldest verifications beyond the store's max.
 func (s *Store) AddVerification(v Verification) (Verification, error) {
+	v, err := s.insertVerification(s.db, v)
+	if err != nil {
+		return Verification{}, err
+	}
+	s.publishVerification(v)
+	return v, nil
+}
+
+func (s *Store) insertVerification(db execer, v Verification) (Verification, error) {
 	now := stamp(s.now())
 	v.CreatedAt, v.UpdatedAt, v.ExpiresAt = now, now, now.Add(VerificationTTL)
 	var digits string
@@ -89,7 +98,7 @@ func (s *Store) AddVerification(v Verification) (Verification, error) {
 	if err != nil {
 		return Verification{}, err
 	}
-	_, err = s.db.Exec(`INSERT INTO verifications (`+verificationColumns+`, recipient_digits)
+	_, err = db.Exec(`INSERT INTO verifications (`+verificationColumns+`, recipient_digits)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		v.ID, v.ServiceSID, v.AccountSID, v.To, v.Channel, v.Code, v.Status, string(sent),
 		v.CheckAttempts, now.UnixNano(), now.UnixNano(), v.ExpiresAt.UnixNano(), digits)
@@ -97,11 +106,10 @@ func (s *Store) AddVerification(v Verification) (Verification, error) {
 		return Verification{}, err
 	}
 	if s.max > 0 {
-		if _, err := s.db.Exec(`DELETE FROM verifications WHERE seq <= (SELECT MAX(seq) FROM verifications) - ?`, s.max); err != nil {
+		if _, err := db.Exec(`DELETE FROM verifications WHERE seq <= (SELECT MAX(seq) FROM verifications) - ?`, s.max); err != nil {
 			return Verification{}, err
 		}
 	}
-	s.publishVerification(v)
 	return v, nil
 }
 
@@ -109,11 +117,20 @@ func (s *Store) AddVerification(v Verification) (Verification, error) {
 // CheckAttempts and ExpiresAt, sets UpdatedAt to now, and returns the
 // verification as stored. Expiry is not applied to the returned value.
 func (s *Store) UpdateVerification(v Verification) (Verification, error) {
+	got, err := s.updateVerification(s.db, v)
+	if err != nil {
+		return Verification{}, err
+	}
+	s.publishVerification(got)
+	return got, nil
+}
+
+func (s *Store) updateVerification(db execer, v Verification) (Verification, error) {
 	sent, err := json.Marshal(attempts(v.SendAttempts))
 	if err != nil {
 		return Verification{}, err
 	}
-	res, err := s.db.Exec(`UPDATE verifications SET channel = ?, code = ?, status = ?, send_attempts = ?,
+	res, err := db.Exec(`UPDATE verifications SET channel = ?, code = ?, status = ?, send_attempts = ?,
 		check_attempts = ?, expires_at = ?, updated_at = ? WHERE id = ?`,
 		v.Channel, v.Code, v.Status, string(sent), v.CheckAttempts, stamp(v.ExpiresAt).UnixNano(),
 		stamp(s.now()).UnixNano(), v.ID)
@@ -125,17 +142,46 @@ func (s *Store) UpdateVerification(v Verification) (Verification, error) {
 	} else if n == 0 {
 		return Verification{}, ErrNotFound
 	}
-	got, err := s.getVerification(v.ID)
+	return readVerification(db, v.ID)
+}
+
+// SendVerification stores one send of a verification's code in a single
+// transaction: v is added (isNew) or updated as AddVerification or
+// UpdateVerification would, and m, the message carrying the code, is added
+// as Add would. When either write fails, neither is stored and nothing is
+// published.
+func (s *Store) SendVerification(v Verification, isNew bool, m Message) (Verification, Message, error) {
+	tx, err := s.db.Begin()
 	if err != nil {
-		return Verification{}, err
+		return Verification{}, Message{}, err
 	}
-	s.publishVerification(got)
-	return got, nil
+	defer tx.Rollback()
+	if isNew {
+		v, err = s.insertVerification(tx, v)
+	} else {
+		v, err = s.updateVerification(tx, v)
+	}
+	if err != nil {
+		return Verification{}, Message{}, err
+	}
+	if m, err = s.insertMessage(tx, m); err != nil {
+		return Verification{}, Message{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Verification{}, Message{}, err
+	}
+	s.publishVerification(v)
+	s.publish(Event{Type: "message", Message: &m})
+	return v, m, nil
 }
 
 // getVerification reads a verification as stored, without applying expiry.
 func (s *Store) getVerification(id string) (Verification, error) {
-	v, err := scanVerification(s.db.QueryRow(`SELECT `+verificationColumns+` FROM verifications WHERE id = ?`, id))
+	return readVerification(s.db, id)
+}
+
+func readVerification(db execer, id string) (Verification, error) {
+	v, err := scanVerification(db.QueryRow(`SELECT `+verificationColumns+` FROM verifications WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Verification{}, ErrNotFound
 	}

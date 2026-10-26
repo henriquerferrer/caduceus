@@ -141,6 +141,7 @@ func (s *Server) verifyStart(w http.ResponseWriter, r *http.Request) {
 	defer s.verifyMu.Unlock()
 	attempt := store.SendAttempt{SID: store.NewSID("VL"), Channel: channel, Time: time.Now()}
 	v, err := s.store.PendingVerification(service, to)
+	isNew := errors.Is(err, store.ErrNotFound)
 	switch {
 	case err == nil:
 		if len(v.SendAttempts) >= store.MaxSendAttempts {
@@ -149,35 +150,47 @@ func (s *Server) verifyStart(w http.ResponseWriter, r *http.Request) {
 		}
 		v.Channel = channel
 		v.SendAttempts = append(v.SendAttempts, attempt)
-		v, err = s.store.UpdateVerification(v)
-	case errors.Is(err, store.ErrNotFound):
+	case isNew:
 		code := r.PostForm.Get("CustomCode")
 		if code == "" {
 			if code, err = randomCode(); err != nil {
-				s.fail(w, err)
+				s.twilioFail(w, r, err)
 				return
 			}
 		}
-		v, err = s.store.AddVerification(store.Verification{
+		v = store.Verification{
 			ID: store.NewSID("VE"), ServiceSID: service, AccountSID: accountSID(r),
 			To: to, Channel: channel, Code: code, Status: "pending",
 			SendAttempts: []store.SendAttempt{attempt},
-		})
-	}
-	if err != nil {
-		s.fail(w, err)
+		}
+	default:
+		s.twilioFail(w, r, err)
 		return
 	}
-	_, err = s.capture(store.Message{
+	// The verification and the message carrying its code are stored together:
+	// a send that fails uses up no attempt and leaves no code in the inbox.
+	v, m, err := s.store.SendVerification(v, isNew, outbound(store.Message{
 		Provider: verifyProvider, AccountSID: v.AccountSID, From: "Verify", To: v.To,
 		Body: "Your verification code is: " + v.Code, OTP: v.Code,
 		Channel: channel, VerificationSID: v.ID,
-	})
+	}))
 	if err != nil {
-		s.fail(w, err)
+		s.twilioFail(w, r, err)
 		return
 	}
+	s.captured(m)
 	writeJSON(w, http.StatusCreated, twilioVerification(r, v))
+}
+
+// twilioFail answers a Verify request whose storage failed: 20404 when the
+// verification is gone, else Twilio's 500 error.
+func (s *Server) twilioFail(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, store.ErrNotFound) {
+		twilioNotFound(w, r)
+		return
+	}
+	s.log.Error("storage failed", "err", err)
+	twilioError(w, http.StatusInternalServerError, 20500, "Internal Server Error")
 }
 
 // serviceVerification returns the verification the path names, or
@@ -200,7 +213,7 @@ func (s *Server) verifyFetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.fail(w, err)
+		s.twilioFail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, twilioVerification(r, v))
@@ -225,12 +238,12 @@ func (s *Server) verifyUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.fail(w, err)
+		s.twilioFail(w, r, err)
 		return
 	}
 	v.Status = status
 	if v, err = s.store.UpdateVerification(v); err != nil {
-		s.fail(w, err)
+		s.twilioFail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, twilioVerification(r, v))
