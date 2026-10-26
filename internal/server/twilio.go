@@ -49,13 +49,19 @@ func twilioMessage(m store.Message) map[string]any {
 	}
 }
 
-func twilioError(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, http.StatusBadRequest, map[string]any{
+// twilioError writes Twilio's JSON error shape with the given HTTP status.
+func twilioError(w http.ResponseWriter, status, code int, msg string) {
+	writeJSON(w, status, map[string]any{
 		"code":      code,
 		"message":   msg,
 		"more_info": fmt.Sprintf("https://www.twilio.com/docs/errors/%d", code),
-		"status":    http.StatusBadRequest,
+		"status":    status,
 	})
+}
+
+// twilioNotFound writes Twilio's 20404 error for the requested path.
+func twilioNotFound(w http.ResponseWriter, r *http.Request) {
+	twilioError(w, http.StatusNotFound, 20404, "The requested resource "+r.URL.Path+" was not found")
 }
 
 func twilioStatusForm(m store.Message) url.Values {
@@ -93,20 +99,20 @@ func (s *Server) twilioRoutes(mux *http.ServeMux) {
 
 func (s *Server) twilioCreate(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
-		twilioError(w, 20001, "Could not parse the request body.")
+		twilioError(w, http.StatusBadRequest, 20001, "Could not parse the request body.")
 		return
 	}
 	to, body := r.PostForm.Get("To"), r.PostForm.Get("Body")
 	from := cmpOr(r.PostForm.Get("From"), r.PostForm.Get("MessagingServiceSid"))
 	switch {
 	case to == "":
-		twilioError(w, 21604, "A 'To' phone number is required.")
+		twilioError(w, http.StatusBadRequest, 21604, "A 'To' phone number is required.")
 		return
 	case from == "":
-		twilioError(w, 21603, "A 'From' phone number is required.")
+		twilioError(w, http.StatusBadRequest, 21603, "A 'From' phone number is required.")
 		return
 	case body == "":
-		twilioError(w, 21602, "Message body is required.")
+		twilioError(w, http.StatusBadRequest, 21602, "Message body is required.")
 		return
 	}
 	m, err := s.capture(store.Message{
@@ -126,13 +132,10 @@ func (s *Server) twilioCreate(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) twilioFetch(w http.ResponseWriter, r *http.Request) {
 	m, err := s.store.Get(strings.TrimSuffix(r.PathValue("sid"), ".json"))
-	if errors.Is(err, store.ErrNotFound) {
-		writeJSON(w, http.StatusNotFound, map[string]any{
-			"code":      20404,
-			"message":   "The requested resource " + r.URL.Path + " was not found",
-			"more_info": "https://www.twilio.com/docs/errors/20404",
-			"status":    http.StatusNotFound,
-		})
+	// A Verify capture is not a Messaging resource, so the Messages API
+	// does not know it.
+	if errors.Is(err, store.ErrNotFound) || (err == nil && m.Provider == verifyProvider) {
+		twilioNotFound(w, r)
 		return
 	}
 	if err != nil {
@@ -148,9 +151,11 @@ func (s *Server) twilioList(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	out := make([]map[string]any, len(msgs))
-	for i, m := range msgs {
-		out[i] = twilioMessage(m)
+	out := []map[string]any{}
+	for _, m := range msgs {
+		if m.Provider != verifyProvider {
+			out = append(out, twilioMessage(m))
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"messages":          out,

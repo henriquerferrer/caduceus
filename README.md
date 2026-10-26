@@ -29,7 +29,7 @@ HTTP_PROXY=http://localhost:8026
 NODE_EXTRA_CA_CERTS="$HOME/Library/Application Support/caduceus/ca.pem"   # Node
 ```
 
-The first sends the SDK's traffic through Caduceus. The second makes the app trust the local certificate authority that Caduceus creates on first run, which it uses to answer as `api.twilio.com`. The CA path is printed at startup and the certificate is also served at `http://localhost:8026/ca.pem`. Without it the request fails with a certificate error; it never reaches the real provider.
+The first sends the SDK's traffic through Caduceus. The second makes the app trust the local certificate authority that Caduceus creates on first run, which it uses to answer as `api.twilio.com` and `verify.twilio.com`. The CA path is printed at startup and the certificate is also served at `http://localhost:8026/ca.pem`. Without it the request fails with a certificate error; it never reaches the real provider.
 
 | Runtime | Proxy variable | CA variable |
 |---|---|---|
@@ -37,9 +37,27 @@ The first sends the SDK's traffic through Caduceus. The second makes the app tru
 | Python (`requests`) | `HTTPS_PROXY` | `REQUESTS_CA_BUNDLE` (not yet verified) |
 | Go, Ruby, curl | `HTTPS_PROXY` | `SSL_CERT_FILE` (not yet verified) |
 
-Emulated so far: Twilio Programmable Messaging (create, fetch and list messages on `api.twilio.com` and its regional hosts). Any credentials are accepted for those calls.
+Emulated so far: Twilio Programmable Messaging (create, fetch and list messages on `api.twilio.com` and its regional hosts) and Twilio Verify (below). Any credentials are accepted for those calls.
 
-Everything else a provider offers keeps working. Caduceus intercepts only the host that carries an emulated API, and on that host it forwards every endpoint it doesn't emulate to the real provider with your real credentials. With Twilio, voice calls, Verify and Lookup all reach Twilio as usual. Note that Twilio Verify sends its own SMS from Twilio's side, so those codes go to real phones and do not appear in Caduceus.
+Everything else a provider offers keeps working. Caduceus intercepts only the hosts that carry an emulated API, and on those hosts it forwards every endpoint it doesn't emulate to the real provider with your real credentials. Each host answers only its own API: Verify paths sent to `api.twilio.com` and Messaging paths sent to `verify.twilio.com` go to Twilio. With Twilio, voice calls and Lookup reach Twilio as usual.
+
+### Twilio Verify
+
+Verification codes land in the Caduceus inbox instead of on a real phone. On `verify.twilio.com` (and its regional hosts, or the local base URL) Caduceus answers:
+
+| Endpoint | What it does |
+|---|---|
+| `POST /v2/Services/{VA…}/Verifications` | Starts a verification (`To`, `Channel`; `CustomCode` optional) and captures the code as a message |
+| `GET /v2/Services/{VA…}/Verifications/{VE…}` | Fetches it |
+| `POST /v2/Services/{VA…}/Verifications/{VE…}` | Sets `Status` to `canceled` or `approved` while it is pending |
+
+- Any service SID starting with `VA` works with no setup, so your app's existing one does. Fetching or updating a verification through a different service SID answers `20404`, as Twilio does.
+- The channels `sms`, `call`, `whatsapp`, `email`, `sna` and `auto` are captured; the message's `channel` says which. Phone channels need an E.164 `To` (`+` then digits); `email` needs an address.
+- The code is 6 random digits, or your `CustomCode`. The captured message's `otp` is the code, so `/api/v1/wait` returns it for a phone recipient.
+- Twilio's limits apply: a verification is pending for 10 minutes, a send to a recipient with a pending verification on the same service resends the same code, and the send after the fifth is refused with error `60203` (HTTP 429).
+- Other start parameters (`Locale`, `CustomMessage`, `CustomFriendlyName`, `TemplateSid`, `AppHash`, `Amount`, `Payee`, `RiskCheck`, `DeviceIp` and the rest) are accepted and ignored.
+- Verify captures are not Messaging resources: the Messages API does not list or fetch them.
+- Not emulated, so passed through to Twilio: Services, Rate Limits, Messaging Configurations, Webhooks, Access Tokens and TOTP Entities, Factors and Challenges. Checking a code (`VerificationCheck`) is not emulated yet either.
 
 Without the proxy, send to Caduceus directly:
 
