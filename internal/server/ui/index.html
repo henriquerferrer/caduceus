@@ -106,19 +106,35 @@ const shownStatus = v => v.status === 'pending' && Date.parse(v.expires_at) <= D
 const tone = status => status === 'approved' ? 'approved' : status === 'pending' ? '' : 'ended';
 
 function badge(m) {
-  const v = verifications.get(m.verification_sid);
-  const status = v && shownStatus(v);
-  return el('span', { className: 'verification ' + (status ? tone(status) : ''), title: 'Verification ' + m.verification_sid },
-    [m.channel, status].filter(Boolean).join(' · '));
+  const node = el('span', { title: 'Verification ' + m.verification_sid });
+  node.dataset.sid = m.verification_sid;
+  node.dataset.channel = m.channel ?? '';
+  return paint(node);
 }
 
-// scheduleExpiry re-renders when the soonest pending verification in the open
-// thread expires, so its badge turns to expired without an event.
+// paint sets a badge's text and tone from its verification's shown status.
+function paint(node) {
+  const v = verifications.get(node.dataset.sid);
+  const status = v && shownStatus(v);
+  node.className = 'verification ' + (status ? tone(status) : '');
+  node.textContent = [node.dataset.channel, status].filter(Boolean).join(' · ');
+  return node;
+}
+
+// repaintBadges updates the open thread's badges in place, so an expiry with
+// no server activity leaves keyboard focus and the scroll position alone.
+function repaintBadges() {
+  const nodes = [...document.querySelectorAll('#thread .verification')].map(paint);
+  scheduleExpiry(nodes.map(n => verifications.get(n.dataset.sid)).filter(Boolean));
+}
+
+// scheduleExpiry repaints the badges when the soonest pending verification in
+// the open thread expires, so its badge turns to expired without an event.
 function scheduleExpiry(shown) {
   clearTimeout(expiryTimer);
   const now = Date.now();
   const next = Math.min(...shown.filter(v => v.status === 'pending').map(v => Date.parse(v.expires_at)).filter(t => t > now));
-  if (Number.isFinite(next)) expiryTimer = setTimeout(render, Math.min(next - now, 2 ** 31 - 1));
+  if (Number.isFinite(next)) expiryTimer = setTimeout(repaintBadges, Math.min(next - now, 2 ** 31 - 1));
 }
 
 function render() {
@@ -175,7 +191,11 @@ $('reply').onsubmit = async e => {
 $('clear').onclick = () => fetch('/api/v1/messages', { method: 'DELETE' });
 $('search').oninput = load;
 
-new EventSource('/api/v1/events').onmessage = e => {
+const events = new EventSource('/api/v1/events');
+// A change made before the stream was subscribed sent no event to this page,
+// so read everything again each time it opens (including after a reconnect).
+events.onopen = load;
+events.onmessage = e => {
   const event = JSON.parse(e.data);
   if (event.type !== 'verification') return load();
   const v = event.verification;

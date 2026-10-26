@@ -19,11 +19,13 @@ pins the decisions it leaves to the implementer).
   keeps the map it had. A `verification` event on `/api/v1/events` replaces
   that sid's entry and re-renders without refetching; other events reload,
   as before. Between a list read and an event, the copy with the later
-  `updated_at` wins.
+  `updated_at` wins. Each time the event stream opens, the page reloads, so
+  a change made before it subscribed is not missed.
 - Expiry with no event: a pending verification whose `expires_at` is not
   after the browser's clock is shown as `expired`. After each render a
-  single timer re-renders at the soonest future `expires_at` among the open
-  thread's pending verifications.
+  single timer repaints the open thread's badges in place (keeping focus and
+  scroll) at the soonest future `expires_at` among its pending
+  verifications.
 
 ## Contrast fix
 

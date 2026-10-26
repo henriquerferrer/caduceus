@@ -69,6 +69,34 @@ test('a pending verification shows expired once its expiry passes, with no event
   await expect(badge).toHaveText('sms · expired');
 });
 
+test('a badge expiring keeps keyboard focus where it was', async ({ page, request }) => {
+  await page.clock.install();
+  await page.goto('/');
+  const v = await startVerification(request, '+15550003006');
+  const badge = row(page, v.code).locator('.verification');
+  await expect(badge).toHaveText('sms · pending');
+  const copy = row(page, v.code).getByRole('button', { name: v.code });
+  await copy.focus();
+
+  await page.clock.fastForward('10:01');
+  await expect(badge).toHaveText('sms · expired');
+  await expect(copy).toBeFocused();
+});
+
+test('a change made before the event stream connects is still shown', async ({ page, request }) => {
+  // Hold the page's event stream until the change below has been made, so the
+  // change lands after the page's first read and before it subscribes.
+  let release;
+  const held = new Promise(resolve => { release = resolve; });
+  await page.route('**/api/v1/events', async route => { await held; await route.continue(); });
+  await page.goto('/');
+  await expect(page.locator('#thread .empty')).toBeVisible();
+
+  const v = await startVerification(request, '+15550003007');
+  release();
+  await expect(row(page, v.code).locator('.verification')).toHaveText('sms · pending');
+});
+
 test('a message with no verification has no badge', async ({ page, request }) => {
   const sent = await request.post('/api/v1/send', { data: { to: '+15550003004', body: 'Plain message 640012' } });
   expect(sent.status()).toBe(201);
