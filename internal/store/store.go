@@ -274,14 +274,31 @@ func stamp(t time.Time) time.Time {
 	return t.Round(0).UTC()
 }
 
+// execer runs a write on the store's connection or inside a transaction.
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
 func (s *Store) Add(m Message) (Message, error) {
+	m, err := s.insertMessage(s.db, m)
+	if err != nil {
+		return Message{}, err
+	}
+	s.publish(Event{Type: "message", Message: &m})
+	return m, nil
+}
+
+// insertMessage writes m and prunes the oldest messages beyond the store's
+// max, without publishing.
+func (s *Store) insertMessage(db execer, m Message) (Message, error) {
 	// Timestamps are stored in nanoseconds; round-trip through the same
 	// precision so the returned message equals what a later read gives.
 	now := time.Unix(0, s.now().UnixNano()).UTC()
 	m.CreatedAt, m.UpdatedAt = now, now
 	var digits string
 	m.To, digits = recipient(m.To)
-	_, err := s.db.Exec(`INSERT INTO messages (`+columns+`, recipient_digits)
+	_, err := db.Exec(`INSERT INTO messages (`+columns+`, recipient_digits)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.ID, m.Provider, m.Direction, m.AccountSID, m.From, m.To, m.Body, m.Status, m.OTP,
 		m.Encoding, m.Segments, m.StatusCallback, m.Channel, m.VerificationSID,
@@ -290,11 +307,10 @@ func (s *Store) Add(m Message) (Message, error) {
 		return Message{}, err
 	}
 	if s.max > 0 {
-		if _, err := s.db.Exec(`DELETE FROM messages WHERE seq <= (SELECT MAX(seq) FROM messages) - ?`, s.max); err != nil {
+		if _, err := db.Exec(`DELETE FROM messages WHERE seq <= (SELECT MAX(seq) FROM messages) - ?`, s.max); err != nil {
 			return Message{}, err
 		}
 	}
-	s.publish(Event{Type: "message", Message: &m})
 	return m, nil
 }
 

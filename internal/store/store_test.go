@@ -643,3 +643,54 @@ func TestMigratesPreF1Database(t *testing.T) {
 		t.Fatalf("after reopen: %+v, %v", got, err)
 	}
 }
+
+// SendVerification writes the verification and its message in one
+// transaction: when the message cannot be stored, neither is, and no event is
+// published.
+func TestSendVerificationIsAtomic(t *testing.T) {
+	s, err := Open("", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	msg := func(v Verification) Message {
+		return Message{ID: NewSID("SM"), Direction: Outbound, To: v.To, Body: v.Code, OTP: v.Code, Status: "queued", VerificationSID: v.ID}
+	}
+	fresh := Verification{ID: NewSID("VE"), ServiceSID: "VAone", To: "+15551234567", Channel: "sms", Code: "123456", Status: "pending",
+		SendAttempts: []SendAttempt{{SID: NewSID("VL"), Channel: "sms", Time: time.Now()}}}
+
+	v, m, err := s.SendVerification(fresh, true, msg(fresh))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.GetVerification(v.ID); err != nil || !reflect.DeepEqual(got, v) {
+		t.Fatalf("stored %+v, %v; want %+v", got, err, v)
+	}
+	if got, err := s.Get(m.ID); err != nil || got.VerificationSID != v.ID {
+		t.Fatalf("message %+v, %v", got, err)
+	}
+
+	events, cancel := s.Subscribe()
+	defer cancel()
+	if _, err := s.db.Exec(`CREATE TRIGGER fail_messages BEFORE INSERT ON messages BEGIN SELECT RAISE(FAIL, 'disk full'); END`); err != nil {
+		t.Fatal(err)
+	}
+	resend := v
+	resend.Channel = "whatsapp"
+	resend.SendAttempts = append(resend.SendAttempts, SendAttempt{SID: NewSID("VL"), Channel: "whatsapp", Time: time.Now()})
+	if _, _, err := s.SendVerification(resend, false, msg(resend)); err == nil {
+		t.Fatal("resend succeeded with message inserts failing")
+	}
+	if got, err := s.GetVerification(v.ID); err != nil || !reflect.DeepEqual(got, v) {
+		t.Fatalf("after a failed resend %+v, %v; want %+v", got, err, v)
+	}
+	other := fresh
+	other.ID, other.To = NewSID("VE"), "+15557654321"
+	if _, _, err := s.SendVerification(other, true, msg(other)); err == nil {
+		t.Fatal("new send succeeded with message inserts failing")
+	}
+	if _, err := s.GetVerification(other.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("failed new send stored a verification: %v", err)
+	}
+	noEvent(t, events)
+}

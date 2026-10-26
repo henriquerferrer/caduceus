@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/henriquerferrer/caduceus/internal/sms"
@@ -40,10 +41,17 @@ type Server struct {
 	log    *slog.Logger
 	client *http.Client
 	mux    *http.ServeMux
-	// providers holds only the emulated provider routes. Proxied requests
-	// that match none of them go to the real provider.
-	providers *http.ServeMux
-	upstream  *httputil.ReverseProxy
+	// messaging and verify hold only the emulated provider routes, for
+	// api.* and verify.* hosts respectively. Proxied requests that match none
+	// of their host's routes go to the real provider.
+	messaging *http.ServeMux
+	verify    *http.ServeMux
+	// verifyMu serialises every Verify read-modify-write, and the inbox
+	// clear that deletes verifications, so concurrent requests never create
+	// two pending verifications, lose an attempt or lose their verification
+	// between its read and its write.
+	verifyMu sync.Mutex
+	upstream *httputil.ReverseProxy
 	// direct reaches real servers for proxied traffic Caduceus doesn't capture.
 	direct    *http.Transport
 	tunnelled *connListener
@@ -56,7 +64,8 @@ func New(st *store.Store, opts Options) *Server {
 		log:       opts.Logger,
 		client:    &http.Client{Timeout: 10 * time.Second},
 		mux:       http.NewServeMux(),
-		providers: http.NewServeMux(),
+		messaging: http.NewServeMux(),
+		verify:    http.NewServeMux(),
 		direct:    &http.Transport{},
 	}
 	if s.log == nil {
@@ -93,8 +102,11 @@ func New(st *store.Store, opts Options) *Server {
 	s.mux.HandleFunc("GET /api/v1/events", s.handleEvents)
 
 	// Provider routes are also served directly, for clients that can set a base URL.
-	for _, mux := range []*http.ServeMux{s.mux, s.providers} {
+	for _, mux := range []*http.ServeMux{s.mux, s.messaging} {
 		s.twilioRoutes(mux)
+	}
+	for _, mux := range []*http.ServeMux{s.mux, s.verify} {
+		s.verifyRoutes(mux)
 	}
 	return s
 }
@@ -103,23 +115,48 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodConnect:
 		s.handleConnect(w, r)
-	case r.URL.IsAbs() && !intercepted(r.URL.Hostname()):
-		s.forward(w, r)
+	case r.URL.IsAbs():
+		// A plain-HTTP proxy request: never the Caduceus API or UI.
+		s.serveProvider(w, r, r.URL.Hostname(), s.forward)
 	default:
 		s.mux.ServeHTTP(w, r)
 	}
 }
 
 // serveTunnelled handles a request that arrived through the HTTPS proxy for a
-// provider host: emulated endpoints are answered here, the rest of the
-// provider's API is passed through to the real thing.
+// provider host.
 func (s *Server) serveTunnelled(w http.ResponseWriter, r *http.Request) {
-	if _, pattern := s.providers.Handler(r); pattern != "" {
-		s.providers.ServeHTTP(w, r)
-		return
+	host, _, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		host = r.Host
 	}
-	s.log.Info("passing through", "host", r.Host, "method", r.Method, "path", r.URL.Path)
-	s.upstream.ServeHTTP(w, r)
+	s.serveProvider(w, r, host, s.upstream.ServeHTTP)
+}
+
+// providerRoutes returns the emulated routes for host: Verify's on a
+// verify.* host, Messaging's on an api.* host, none on any other host.
+func (s *Server) providerRoutes(host string) *http.ServeMux {
+	switch {
+	case !intercepted(host):
+		return nil
+	case strings.HasPrefix(strings.ToLower(host), "verify."):
+		return s.verify
+	default:
+		return s.messaging
+	}
+}
+
+// serveProvider answers a proxied request with the emulated route for its
+// host, and passes any other request to the real provider through pass.
+func (s *Server) serveProvider(w http.ResponseWriter, r *http.Request, host string, pass http.HandlerFunc) {
+	if routes := s.providerRoutes(host); routes != nil {
+		if _, pattern := routes.Handler(r); pattern != "" {
+			routes.ServeHTTP(w, r)
+			return
+		}
+		s.log.Info("passing through", "host", host, "method", r.Method, "path", r.URL.Path)
+	}
+	pass(w, r)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -142,22 +179,35 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 	writeError(w, http.StatusInternalServerError, "storage error")
 }
 
-// capture stores an outbound message and starts its simulated delivery.
+// capture stores an outbound message and starts its simulated delivery. The
+// OTP is read from the body unless m already carries one.
 func (s *Server) capture(m store.Message) (store.Message, error) {
-	m.ID = store.NewSID("SM")
-	m.Direction = store.Outbound
-	m.Status = "queued"
-	m.OTP = sms.ExtractOTP(m.Body)
-	m.Encoding, m.Segments = sms.Segments(m.Body)
-	m, err := s.store.Add(m)
+	m, err := s.store.Add(outbound(m))
 	if err != nil {
 		return m, err
 	}
+	s.captured(m)
+	return m, nil
+}
+
+// outbound fills in what capture sets on a message before it is stored.
+func outbound(m store.Message) store.Message {
+	m.ID = store.NewSID("SM")
+	m.Direction = store.Outbound
+	m.Status = "queued"
+	if m.OTP == "" {
+		m.OTP = sms.ExtractOTP(m.Body)
+	}
+	m.Encoding, m.Segments = sms.Segments(m.Body)
+	return m
+}
+
+// captured logs a stored outbound message and starts its simulated delivery.
+func (s *Server) captured(m store.Message) {
 	s.log.Info("captured", "provider", m.Provider, "to", m.To, "id", m.ID)
 	if s.opts.DeliveryDelay >= 0 {
 		go s.simulateDelivery(m.ID)
 	}
-	return m, nil
 }
 
 func (s *Server) simulateDelivery(id string) {
@@ -268,6 +318,10 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleClear(w http.ResponseWriter, r *http.Request) {
+	// Clear deletes verifications too, so it is a Verify mutation: it must not
+	// land between a Verify handler's read and its write.
+	s.verifyMu.Lock()
+	defer s.verifyMu.Unlock()
 	if err := s.store.Clear(); err != nil {
 		s.fail(w, err)
 		return

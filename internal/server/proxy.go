@@ -24,11 +24,13 @@ import (
 // intercepted reports whether Caduceus answers for host when used as an
 // HTTPS proxy. Only hosts carrying an emulated API qualify, so a provider's
 // other products keep their own hosts and are tunnelled through untouched.
-// Twilio's messaging API lives on api.twilio.com and regional forms of it,
-// such as api.dublin.ie1.twilio.com.
+// Twilio's messaging API lives on api.twilio.com and Verify on
+// verify.twilio.com, each with regional forms such as
+// api.dublin.ie1.twilio.com.
 func intercepted(host string) bool {
 	host = strings.ToLower(host)
-	return strings.HasPrefix(host, "api.") && strings.HasSuffix(host, ".twilio.com")
+	return (strings.HasPrefix(host, "api.") || strings.HasPrefix(host, "verify.")) &&
+		strings.HasSuffix(host, ".twilio.com")
 }
 
 // CA is the local certificate authority that signs certificates for the
