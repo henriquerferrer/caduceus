@@ -48,16 +48,19 @@ Verification codes land in the Caduceus inbox instead of on a real phone. On `ve
 | Endpoint | What it does |
 |---|---|
 | `POST /v2/Services/{VA…}/Verifications` | Starts a verification (`To`, `Channel`; `CustomCode` optional) and captures the code as a message |
-| `GET /v2/Services/{VA…}/Verifications/{VE…}` | Fetches it |
+| `GET /v2/Services/{VA…}/Verifications/{VE…}` | Fetches it while it is pending |
 | `POST /v2/Services/{VA…}/Verifications/{VE…}` | Sets `Status` to `canceled` or `approved` while it is pending |
+| `POST /v2/Services/{VA…}/VerificationCheck` | Checks a `Code` against the pending verification named by `VerificationSid` or `To` |
 
-- Any service SID starting with `VA` works with no setup, so your app's existing one does. Fetching or updating a verification through a different service SID answers `20404`, as Twilio does.
+- Any service SID starting with `VA` works with no setup, so your app's existing one does. Fetching, updating or checking a verification through a different service SID answers `20404`.
 - The channels `sms`, `call`, `whatsapp`, `email`, `sna` and `auto` are captured; the message's `channel` says which. Phone channels need an E.164 `To` (`+` then digits); `email` needs an address.
 - The code is 6 random digits, or your `CustomCode`. The captured message's `otp` is the code, so `/api/v1/wait` returns it for a phone recipient.
 - Twilio's limits apply: a verification is pending for 10 minutes, a send to a recipient with a pending verification on the same service resends the same code, and the send after the fifth is refused with error `60203` (HTTP 429).
+- Checking: the right code answers `status: approved`, `valid: true`; a wrong one answers `status: pending`, `valid: false` and uses up one of 5 check attempts. The check after the fifth is refused with error `60202` (HTTP 429) and ends the verification. A check with no `Code`, with neither `To` nor `VerificationSid`, or with a `To` that is neither E.164 nor an email address, answers `60200` (HTTP 400).
+- Once a verification is approved, canceled, expired or out of check attempts, checking or fetching it answers `20404` (HTTP 404). Twilio documents a 404 for checking an approved, expired or out-of-attempts verification, which it deletes.
 - Other start parameters (`Locale`, `CustomMessage`, `CustomFriendlyName`, `TemplateSid`, `AppHash`, `Amount`, `Payee`, `RiskCheck`, `DeviceIp` and the rest) are accepted and ignored.
 - Verify captures are not Messaging resources: the Messages API does not list or fetch them.
-- Not emulated, so passed through to Twilio: Services, Rate Limits, Messaging Configurations, Webhooks, Access Tokens and TOTP Entities, Factors and Challenges. Checking a code (`VerificationCheck`) is not emulated yet either.
+- Not emulated, so passed through to Twilio: Services, Rate Limits, Messaging Configurations, Webhooks, Access Tokens and TOTP Entities, Factors and Challenges.
 
 Without the proxy, send to Caduceus directly:
 
