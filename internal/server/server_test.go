@@ -1121,3 +1121,158 @@ func TestVerifyCheckOnBaseURLAndPassThrough(t *testing.T) {
 		t.Fatalf("upstream saw %q, want %q", got, want)
 	}
 }
+
+// apiJSON calls the Caduceus REST API and decodes the JSON answer into out.
+func apiJSON(t *testing.T, method, target string, out any) int {
+	t.Helper()
+	req, err := http.NewRequest(method, target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decode(t, resp, out)
+	return resp.StatusCode
+}
+
+func TestAPIListVerifications(t *testing.T) {
+	ts := newTestServer(t)
+	_, first := startVerification(t, ts.URL, "VAx", url.Values{"To": {"+15550004441"}, "Channel": {"sms"}})
+	_, second := startVerification(t, ts.URL, "VAx", url.Values{"To": {"Ada@Example.com"}, "Channel": {"email"}})
+
+	var list struct{ Verifications []map[string]any }
+	if status := apiJSON(t, http.MethodGet, ts.URL+"/api/v1/verifications", &list); status != http.StatusOK {
+		t.Fatalf("list: %d", status)
+	}
+	if len(list.Verifications) != 2 || list.Verifications[0]["id"] != second["sid"] || list.Verifications[1]["id"] != first["sid"] {
+		t.Fatalf("list is not both, newest first: %v", list.Verifications)
+	}
+	for _, v := range list.Verifications {
+		if code, _ := v["code"].(string); code == "" || v["status"] != "pending" || v["expires_at"] == nil ||
+			v["send_attempts"] == nil || v["check_attempts"] != float64(0) {
+			t.Fatalf("verification lacks its state: %v", v)
+		}
+	}
+
+	for _, c := range []struct{ to, want string }{
+		{"+1 555 000 4441", first["sid"].(string)},
+		{"ada@example.com", second["sid"].(string)},
+	} {
+		list.Verifications = nil
+		apiJSON(t, http.MethodGet, ts.URL+"/api/v1/verifications?to="+url.QueryEscape(c.to), &list)
+		if len(list.Verifications) != 1 || list.Verifications[0]["id"] != c.want {
+			t.Fatalf("?to=%s: %v", c.to, list.Verifications)
+		}
+	}
+}
+
+func TestAPIGetVerification(t *testing.T) {
+	ts := newTestServer(t)
+	_, v := startVerification(t, ts.URL, "VAx", url.Values{"To": {"+15550004442"}, "Channel": {"sms"}})
+	var got store.Verification
+	if status := apiJSON(t, http.MethodGet, ts.URL+"/api/v1/verifications/"+v["sid"].(string), &got); status != http.StatusOK ||
+		got.ID != v["sid"] || got.Status != "pending" || got.Code == "" {
+		t.Fatalf("get: %d %+v", status, got)
+	}
+	var e map[string]any
+	if status := apiJSON(t, http.MethodGet, ts.URL+"/api/v1/verifications/VEunknown", &e); status != http.StatusNotFound || e["error"] == nil {
+		t.Fatalf("unknown sid: %d %v", status, e)
+	}
+}
+
+func TestAPIExpireVerification(t *testing.T) {
+	ts := newTestServer(t)
+	_, v := startVerification(t, ts.URL, "VAx", url.Values{"To": {"+15550004443"}, "Channel": {"sms"}})
+	sid := v["sid"].(string)
+	expire := ts.URL + "/api/v1/verifications/" + sid + "/expire"
+
+	var got store.Verification
+	if status := apiJSON(t, http.MethodPost, expire, &got); status != http.StatusOK || got.ID != sid || got.Status != "expired" {
+		t.Fatalf("expire: %d %+v", status, got)
+	}
+	// The expired verification is gone from Twilio's point of view too.
+	status, body := fetchVerification(t, http.DefaultClient, ts.URL, "VAx", sid)
+	wantTwilioError(t, status, body, http.StatusNotFound, 20404)
+
+	var e map[string]any
+	if status := apiJSON(t, http.MethodPost, expire, &e); status != http.StatusConflict || e["error"] == nil {
+		t.Fatalf("second expire: %d %v", status, e)
+	}
+	e = nil
+	if status := apiJSON(t, http.MethodPost, ts.URL+"/api/v1/verifications/VEunknown/expire", &e); status != http.StatusNotFound || e["error"] == nil {
+		t.Fatalf("unknown sid: %d %v", status, e)
+	}
+}
+
+// Expiring takes verifyMu, so it never lands between a Verify check's read and
+// its write.
+func TestAPIExpireWaitsForVerifyMutations(t *testing.T) {
+	ts := newTestServer(t)
+	srv := ts.Config.Handler.(*Server)
+	_, v := startVerification(t, ts.URL, "VAx", url.Values{"To": {"+15550004444"}, "Channel": {"sms"}})
+	srv.verifyMu.Lock()
+	done := make(chan int, 1)
+	go func() {
+		resp, err := http.Post(ts.URL+"/api/v1/verifications/"+v["sid"].(string)+"/expire", "", nil)
+		if err != nil {
+			t.Error(err)
+			done <- 0
+			return
+		}
+		resp.Body.Close()
+		done <- resp.StatusCode
+	}()
+	select {
+	case status := <-done:
+		srv.verifyMu.Unlock()
+		t.Fatalf("expire finished (%d) while a Verify mutation held verifyMu", status)
+	case <-time.After(200 * time.Millisecond):
+	}
+	srv.verifyMu.Unlock()
+	select {
+	case status := <-done:
+		if status != http.StatusOK {
+			t.Fatalf("expire: %d", status)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("expire did not finish after verifyMu was released")
+	}
+}
+
+func TestClearDeletesVerifications(t *testing.T) {
+	ts := newTestServer(t)
+	startVerification(t, ts.URL, "VAx", url.Values{"To": {"+15550004445"}, "Channel": {"sms"}})
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/messages", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	var list struct{ Verifications []store.Verification }
+	if status := apiJSON(t, http.MethodGet, ts.URL+"/api/v1/verifications", &list); status != http.StatusOK || len(list.Verifications) != 0 {
+		t.Fatalf("after clear: %d %+v", status, list.Verifications)
+	}
+}
+
+func TestWaitForEmailRecipient(t *testing.T) {
+	ts := newTestServer(t)
+	resp, err := http.Post(ts.URL+"/api/v1/send", "application/json", strings.NewReader(`{"to":"Ada@Example.com","body":"Your code is 482913"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sent store.Message
+	decode(t, resp, &sent)
+
+	var got store.Message
+	if status := apiJSON(t, http.MethodGet, ts.URL+"/api/v1/wait?timeout=2s&to="+url.QueryEscape("ada@example.com"), &got); status != http.StatusOK ||
+		got.ID != sent.ID || got.OTP != "482913" {
+		t.Fatalf("wait for an email: %d %+v", status, got)
+	}
+
+	var e map[string]any
+	if status := apiJSON(t, http.MethodGet, ts.URL+"/api/v1/wait?timeout=2s&to=nobody", &e); status != http.StatusBadRequest || e["error"] == nil {
+		t.Fatalf("?to=nobody: %d %v", status, e)
+	}
+}
