@@ -1,4 +1,5 @@
-// Package store keeps captured messages in SQLite and notifies subscribers.
+// Package store keeps captured messages and verifications in SQLite and
+// notifies subscribers.
 package store
 
 import (
@@ -19,7 +20,7 @@ const (
 	Inbound  = "inbound"
 )
 
-var ErrNotFound = errors.New("message not found")
+var ErrNotFound = errors.New("not found")
 
 const schema = `
 CREATE TABLE IF NOT EXISTS messages (
@@ -38,38 +39,65 @@ CREATE TABLE IF NOT EXISTS messages (
 	segments         INTEGER NOT NULL,
 	status_callback  TEXT NOT NULL,
 	created_at       INTEGER NOT NULL,
-	updated_at       INTEGER NOT NULL
+	updated_at       INTEGER NOT NULL,
+	channel          TEXT NOT NULL DEFAULT '',
+	verification_sid TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS messages_recipient ON messages (recipient_digits);`
+CREATE INDEX IF NOT EXISTS messages_recipient ON messages (recipient_digits);
+CREATE TABLE IF NOT EXISTS verifications (
+	seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+	id               TEXT NOT NULL UNIQUE,
+	service_sid      TEXT NOT NULL,
+	account_sid      TEXT NOT NULL,
+	recipient        TEXT NOT NULL,
+	recipient_digits TEXT NOT NULL,
+	channel          TEXT NOT NULL,
+	code             TEXT NOT NULL,
+	status           TEXT NOT NULL,
+	send_attempts    TEXT NOT NULL,
+	check_attempts   INTEGER NOT NULL,
+	created_at       INTEGER NOT NULL,
+	updated_at       INTEGER NOT NULL,
+	expires_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS verifications_pending ON verifications (service_sid, status);`
 
 const columns = `id, provider, direction, account_sid, sender, recipient, body, status, otp,
-	encoding, segments, status_callback, created_at, updated_at`
+	encoding, segments, status_callback, channel, verification_sid, created_at, updated_at`
 
 type Message struct {
-	ID             string    `json:"id"`
-	Provider       string    `json:"provider"`
-	Direction      string    `json:"direction"`
-	AccountSID     string    `json:"account_sid,omitempty"`
-	From           string    `json:"from"`
-	To             string    `json:"to"`
-	Body           string    `json:"body"`
-	Status         string    `json:"status"`
-	OTP            string    `json:"otp,omitempty"`
-	Encoding       string    `json:"encoding"`
-	Segments       int       `json:"segments"`
-	StatusCallback string    `json:"status_callback,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID              string    `json:"id"`
+	Provider        string    `json:"provider"`
+	Direction       string    `json:"direction"`
+	AccountSID      string    `json:"account_sid,omitempty"`
+	From            string    `json:"from"`
+	To              string    `json:"to"`
+	Body            string    `json:"body"`
+	Status          string    `json:"status"`
+	OTP             string    `json:"otp,omitempty"`
+	Encoding        string    `json:"encoding"`
+	Segments        int       `json:"segments"`
+	StatusCallback  string    `json:"status_callback,omitempty"`
+	Channel         string    `json:"channel,omitempty"`
+	VerificationSID string    `json:"verification_sid,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
-// Event is published on every change. Type is "message", "status" or "clear".
+// Event is published on every change. Type is "message", "status",
+// "verification" or "clear".
 type Event struct {
-	Type    string   `json:"type"`
-	Message *Message `json:"message,omitempty"`
+	Type         string        `json:"type"`
+	Message      *Message      `json:"message,omitempty"`
+	Verification *Verification `json:"verification,omitempty"`
 }
 
 type Filter struct {
-	To        string // compared by digits only, so "+1 (555) 000" matches "1555000"
+	// To is an email address when it contains "@", matched case-insensitively
+	// as a whole address; otherwise a phone number, compared by digits only, so
+	// "+1 (555) 000" matches "1555000". A phone number never matches an email
+	// recipient.
+	To        string
 	Direction string
 	Query     string
 	Since     time.Time
@@ -81,13 +109,17 @@ type Store struct {
 	max  int
 	temp string // database file to delete on Close; empty when persistent
 
+	now func() time.Time // the clock; tests replace it
+
 	mu   sync.RWMutex
 	subs map[chan Event]struct{}
 }
 
 // Open opens the database at path, creating it if needed. An empty path uses
 // a temporary database that is deleted on Close. max is the number of
-// messages kept before the oldest are pruned; 0 keeps everything.
+// messages, and separately of verifications, kept before the oldest are
+// pruned; 0 keeps everything. A database created before verifications existed
+// is migrated in place.
 func Open(path string, max int) (*Store, error) {
 	temp := ""
 	if path == "" {
@@ -108,7 +140,83 @@ func Open(path string, max int) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db, max: max, temp: temp, subs: map[chan Event]struct{}{}}, nil
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Store{db: db, max: max, temp: temp, now: time.Now, subs: map[chan Event]struct{}{}}, nil
+}
+
+// migrate brings a messages table created before verifications existed up to
+// the current schema: it adds the columns it lacks and normalises its email
+// recipients the way new writes store them. A current database has every
+// column, so this changes nothing.
+func migrate(db *sql.DB) error {
+	have := map[string]bool{}
+	rows, err := db.Query(`SELECT name FROM pragma_table_info('messages')`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		have[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	var missing []string
+	for _, c := range []string{"channel", "verification_sid"} {
+		if !have[c] {
+			missing = append(missing, c)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, c := range missing {
+		if _, err := tx.Exec(`ALTER TABLE messages ADD COLUMN ` + c + ` TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	type row struct {
+		seq int64
+		to  string
+	}
+	var emails []row
+	rows, err = tx.Query(`SELECT seq, recipient FROM messages WHERE instr(recipient, '@') > 0`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.seq, &r.to); err != nil {
+			rows.Close()
+			return err
+		}
+		emails = append(emails, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, r := range emails {
+		to, digits := recipient(r.to)
+		if _, err := tx.Exec(`UPDATE messages SET recipient = ?, recipient_digits = ? WHERE seq = ?`, to, digits, r.seq); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Close() error {
@@ -136,15 +244,48 @@ func Digits(s string) string {
 	}, s)
 }
 
+func isEmail(s string) bool { return strings.Contains(s, "@") }
+
+// recipient returns how a recipient is stored and the digits it is indexed by.
+// An email address is lowercased and has no digits, so no phone number
+// matches it.
+func recipient(to string) (stored, digits string) {
+	if isEmail(to) {
+		return strings.ToLower(to), ""
+	}
+	return to, Digits(to)
+}
+
+// toClause returns the SQL condition and argument for f.To, or an empty
+// condition when f.To filters nothing.
+func (f Filter) toClause() (string, string) {
+	if isEmail(f.To) {
+		return "recipient = ?", strings.ToLower(f.To)
+	}
+	if d := Digits(f.To); d != "" {
+		return "recipient_digits = ?", d
+	}
+	return "", ""
+}
+
+// stamp drops t's monotonic reading and sub-nanosecond state and puts it in
+// UTC, so a value equals what a later read of the stored value gives.
+func stamp(t time.Time) time.Time {
+	return t.Round(0).UTC()
+}
+
 func (s *Store) Add(m Message) (Message, error) {
 	// Timestamps are stored in nanoseconds; round-trip through the same
 	// precision so the returned message equals what a later read gives.
-	now := time.Unix(0, time.Now().UnixNano()).UTC()
+	now := time.Unix(0, s.now().UnixNano()).UTC()
 	m.CreatedAt, m.UpdatedAt = now, now
+	var digits string
+	m.To, digits = recipient(m.To)
 	_, err := s.db.Exec(`INSERT INTO messages (`+columns+`, recipient_digits)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.ID, m.Provider, m.Direction, m.AccountSID, m.From, m.To, m.Body, m.Status, m.OTP,
-		m.Encoding, m.Segments, m.StatusCallback, now.UnixNano(), now.UnixNano(), Digits(m.To))
+		m.Encoding, m.Segments, m.StatusCallback, m.Channel, m.VerificationSID,
+		now.UnixNano(), now.UnixNano(), digits)
 	if err != nil {
 		return Message{}, err
 	}
@@ -163,7 +304,7 @@ func scan(row scanner) (Message, error) {
 	var m Message
 	var created, updated int64
 	err := row.Scan(&m.ID, &m.Provider, &m.Direction, &m.AccountSID, &m.From, &m.To, &m.Body, &m.Status,
-		&m.OTP, &m.Encoding, &m.Segments, &m.StatusCallback, &created, &updated)
+		&m.OTP, &m.Encoding, &m.Segments, &m.StatusCallback, &m.Channel, &m.VerificationSID, &created, &updated)
 	m.CreatedAt, m.UpdatedAt = time.Unix(0, created).UTC(), time.Unix(0, updated).UTC()
 	return m, err
 }
@@ -179,8 +320,8 @@ func (s *Store) Get(id string) (Message, error) {
 // List returns matching messages, newest first.
 func (s *Store) List(f Filter) ([]Message, error) {
 	where, args := []string{"1"}, []any{}
-	if to := Digits(f.To); to != "" {
-		where, args = append(where, "recipient_digits = ?"), append(args, to)
+	if clause, to := f.toClause(); clause != "" {
+		where, args = append(where, clause), append(args, to)
 	}
 	if f.Direction != "" {
 		where, args = append(where, "direction = ?"), append(args, f.Direction)
@@ -217,7 +358,11 @@ func (s *Store) List(f Filter) ([]Message, error) {
 // Matches reports whether a newly published message passes the filter's To,
 // Direction and Since conditions.
 func (f Filter) Matches(m Message) bool {
-	if to := Digits(f.To); to != "" && Digits(m.To) != to {
+	if isEmail(f.To) {
+		if strings.ToLower(m.To) != strings.ToLower(f.To) {
+			return false
+		}
+	} else if to := Digits(f.To); to != "" && (isEmail(m.To) || Digits(m.To) != to) {
 		return false
 	}
 	if f.Direction != "" && m.Direction != f.Direction {
@@ -227,7 +372,7 @@ func (f Filter) Matches(m Message) bool {
 }
 
 func (s *Store) SetStatus(id, status string) (Message, error) {
-	res, err := s.db.Exec(`UPDATE messages SET status = ?, updated_at = ? WHERE id = ?`, status, time.Now().UnixNano(), id)
+	res, err := s.db.Exec(`UPDATE messages SET status = ?, updated_at = ? WHERE id = ?`, status, s.now().UnixNano(), id)
 	if err != nil {
 		return Message{}, err
 	}
@@ -242,8 +387,19 @@ func (s *Store) SetStatus(id, status string) (Message, error) {
 	return m, nil
 }
 
+// Clear deletes every message and every verification.
 func (s *Store) Clear() error {
-	if _, err := s.db.Exec(`DELETE FROM messages`); err != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, table := range []string{"messages", "verifications"} {
+		if _, err := tx.Exec(`DELETE FROM ` + table); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
 		return err
 	}
 	s.publish(Event{Type: "clear"})

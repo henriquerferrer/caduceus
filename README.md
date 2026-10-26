@@ -80,7 +80,7 @@ Each captured message moves from `queued` to `sent` to `delivered`, and Caduceus
 | `-listen` | `CADUCEUS_LISTEN` | `127.0.0.1:8026` | Listen address |
 | `-data-dir` | `CADUCEUS_DATA_DIR` | user config dir | Where the proxy CA certificate and key are kept |
 | `-database` | `CADUCEUS_DATABASE` | temporary | SQLite file for messages |
-| `-max-messages` | | `5000` | Messages kept before the oldest are dropped (0 keeps all) |
+| `-max-messages` | | `5000` | Messages kept before the oldest are dropped (0 keeps all); also caps Verify verifications, counted separately |
 | `-delivery-delay` | | `1s` | Pause before each simulated status change; negative disables |
 | `-inbound-webhook` | `CADUCEUS_INBOUND_WEBHOOK` | | Default URL for simulated inbound messages |
 
