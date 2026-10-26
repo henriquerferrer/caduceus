@@ -54,7 +54,7 @@ Verification codes land in the Caduceus inbox instead of on a real phone. On `ve
 
 - Any service SID starting with `VA` works with no setup, so your app's existing one does. Fetching, updating or checking a verification through a different service SID answers `20404`.
 - The channels `sms`, `call`, `whatsapp`, `email`, `sna` and `auto` are captured; the message's `channel` says which. Phone channels need an E.164 `To` (`+` then digits); `email` needs an address.
-- The code is 6 random digits, or your `CustomCode`. The captured message's `otp` is the code, so `/api/v1/wait` returns it for a phone recipient.
+- The code is 6 random digits, or your `CustomCode`. The captured message's `otp` is the code, so `/api/v1/wait` returns it for a phone number or an email address.
 - Twilio's limits apply: a verification is pending for 10 minutes, a send to a recipient with a pending verification on the same service resends the same code, and the send after the fifth is refused with error `60203` (HTTP 429).
 - Checking: the right code answers `status: approved`, `valid: true`; a wrong one answers `status: pending`, `valid: false` and uses up one of 5 check attempts. The check after the fifth is refused with error `60202` (HTTP 429) and ends the verification. A check with no `Code`, with neither `To` nor `VerificationSid`, or with a `To` that is neither E.164 nor an email address, answers `60200` (HTTP 400).
 - Once a verification is approved, canceled, expired or out of check attempts, checking or fetching it answers `20404` (HTTP 404). Twilio documents a 404 for checking an approved, expired or out-of-attempts verification, which it deletes.
@@ -75,20 +75,23 @@ Caduceus listens on `127.0.0.1` by default because an open proxy should not be r
 
 ```sh
 curl -X DELETE localhost:8026/api/v1/messages                 # reset before a test
-curl 'localhost:8026/api/v1/wait?to=%2B15551234567&timeout=10s'  # newest message to a number
+curl 'localhost:8026/api/v1/wait?to=%2B15551234567&timeout=10s'  # newest message to a number or an email address
 ```
 
-`/api/v1/wait` returns the newest outbound message to the number, and blocks until one arrives if there is none yet. The response includes `otp`, the first 4 to 8 digit code found in the body. It answers `408` if nothing arrives in time.
+`/api/v1/wait` returns the newest outbound message to the number or email address, and blocks until one arrives if there is none yet. The response includes `otp`, the first 4 to 8 digit code found in the body. It answers `408` if nothing arrives in time.
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /api/v1/messages?to=&q=&direction=` | List messages, newest first |
 | `GET /api/v1/messages/{id}` | One message |
-| `DELETE /api/v1/messages` | Clear the inbox |
-| `GET /api/v1/wait?to=&timeout=&since=` | Wait for a message to a number |
+| `DELETE /api/v1/messages` | Clear the inbox, verifications included |
+| `GET /api/v1/wait?to=&timeout=&since=` | Wait for a message to a number or an email address |
 | `POST /api/v1/messages/{id}/status` | Force a status such as `failed`; fires the status callback |
 | `POST /api/v1/inbound` | Simulate a reply: `{"from", "to", "body", "webhook"}` posts a Twilio-shaped webhook to your app |
 | `GET /api/v1/events` | Server-sent events for every change |
+| `GET /api/v1/verifications?to=` | List Verify verifications, newest first, with their `code`, `status`, attempts and `expires_at` |
+| `GET /api/v1/verifications/{sid}` | One verification |
+| `POST /api/v1/verifications/{sid}/expire` | Expire a pending verification now, to test the expired path without waiting 10 minutes; `409` if it is not pending |
 
 ## Delivery simulation
 

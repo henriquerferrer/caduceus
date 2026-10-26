@@ -99,6 +99,9 @@ func New(st *store.Store, opts Options) *Server {
 	s.mux.HandleFunc("GET /api/v1/messages/{id}", s.handleGet)
 	s.mux.HandleFunc("POST /api/v1/messages/{id}/status", s.handleSetStatus)
 	s.mux.HandleFunc("GET /api/v1/wait", s.handleWait)
+	s.mux.HandleFunc("GET /api/v1/verifications", s.handleListVerifications)
+	s.mux.HandleFunc("GET /api/v1/verifications/{sid}", s.handleGetVerification)
+	s.mux.HandleFunc("POST /api/v1/verifications/{sid}/expire", s.handleExpireVerification)
 	s.mux.HandleFunc("GET /api/v1/events", s.handleEvents)
 
 	// Provider routes are also served directly, for clients that can set a base URL.
@@ -343,14 +346,68 @@ func (s *Server) handleSetStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, m)
 }
 
-// handleWait returns the newest outbound message to a number, blocking until
-// one arrives if there is none yet. Tests clear the inbox, trigger a send and
+// failVerification reports a storage error from a verification route.
+func (s *Server) failVerification(w http.ResponseWriter, err error) {
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "verification not found")
+		return
+	}
+	s.fail(w, err)
+}
+
+func (s *Server) handleListVerifications(w http.ResponseWriter, r *http.Request) {
+	vs, err := s.store.ListVerifications(store.Filter{To: r.URL.Query().Get("to")})
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"verifications": vs})
+}
+
+func (s *Server) handleGetVerification(w http.ResponseWriter, r *http.Request) {
+	v, err := s.store.GetVerification(r.PathValue("sid"))
+	if err != nil {
+		s.failVerification(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+
+// handleExpireVerification moves a pending verification's expiry to now, so
+// tests reach the expired path without waiting out the TTL.
+func (s *Server) handleExpireVerification(w http.ResponseWriter, r *http.Request) {
+	s.verifyMu.Lock()
+	defer s.verifyMu.Unlock()
+	v, err := s.store.GetVerification(r.PathValue("sid"))
+	if err != nil {
+		s.failVerification(w, err)
+		return
+	}
+	if v.Status != "pending" {
+		writeError(w, http.StatusConflict, "verification is "+v.Status+", not pending")
+		return
+	}
+	v.ExpiresAt = time.Now()
+	if _, err := s.store.UpdateVerification(v); err != nil {
+		s.failVerification(w, err)
+		return
+	}
+	// Reading it back applies the expiry, storing the status as expired.
+	if v, err = s.store.GetVerification(v.ID); err != nil {
+		s.failVerification(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+
+// handleWait returns the newest outbound message to a number or an email
+// address, blocking until one arrives if there is none yet. Tests clear the inbox, trigger a send and
 // call this to read the code.
 func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f := store.Filter{To: q.Get("to"), Direction: store.Outbound, Limit: 1}
-	if store.Digits(f.To) == "" {
-		writeError(w, http.StatusBadRequest, `"to" must be a phone number`)
+	if store.Digits(f.To) == "" && !strings.Contains(f.To, "@") {
+		writeError(w, http.StatusBadRequest, `"to" must be a phone number or an email address`)
 		return
 	}
 	if v := q.Get("since"); v != "" {
