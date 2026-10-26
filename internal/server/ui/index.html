@@ -6,12 +6,12 @@
 <title>Caduceus</title>
 <style>
   :root {
-    --bg: #f6f6f4; --panel: #fff; --line: #e3e2de; --text: #1c1c1a; --muted: #77756f;
+    --bg: #f6f6f4; --panel: #fff; --line: #e3e2de; --text: #1c1c1a; --muted: #69675f;
     --accent: #0b6e4f; --out: #e7f3ee; --in: #ececea; --bad: #b3261e;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #151614; --panel: #1d1e1c; --line: #2e2f2c; --text: #ecebe7; --muted: #96948d;
+      --bg: #151614; --panel: #1d1e1c; --line: #2e2f2c; --text: #ecebe7; --muted: #a6a49d;
       --accent: #5fc9a3; --out: #1f3a30; --in: #2a2b28; --bad: #f2867f;
     }
   }
@@ -40,6 +40,9 @@
   .meta { margin-top: 4px; font-size: 12px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
   .meta .failed { color: var(--bad); }
   .otp { font: 600 12px ui-monospace, monospace; color: var(--accent); border-color: var(--accent); padding: 1px 8px; }
+  .verification { color: var(--text); border: 1px solid var(--muted); border-radius: 6px; padding: 0 8px; }
+  .verification.approved { color: var(--accent); border-color: var(--accent); }
+  .verification.ended { color: var(--bad); border-color: var(--bad); }
   form { display: flex; gap: 8px; padding: 10px 16px; background: var(--panel); border-top: 1px solid var(--line); }
   form input { flex: 1; }
   .empty { margin: auto; color: var(--muted); text-align: center; padding: 24px; }
@@ -67,6 +70,8 @@
 <script>
 const $ = id => document.getElementById(id);
 let messages = [], current = null;
+// Verifications by sid; a message's badge reads its verification_sid here.
+let verifications = new Map(), expiryTimer;
 
 const peer = m => m.direction === 'inbound' ? m.from : m.to;
 const el = (tag, props = {}, ...children) => {
@@ -75,11 +80,45 @@ const el = (tag, props = {}, ...children) => {
   return node;
 };
 
+// newer keeps whichever copy of a verification was updated last, so a list
+// read that raced an event does not undo it.
+const newer = (a, b) => a && Date.parse(a.updated_at) > Date.parse(b.updated_at) ? a : b;
+
 async function load() {
   const q = $('search').value.trim();
-  const res = await fetch('/api/v1/messages' + (q ? '?q=' + encodeURIComponent(q) : ''));
+  const [res, vres] = await Promise.all([
+    fetch('/api/v1/messages' + (q ? '?q=' + encodeURIComponent(q) : '')),
+    fetch('/api/v1/verifications'),
+  ]);
   messages = (await res.json()).messages;
+  // A failed read keeps the statuses already shown.
+  if (vres.ok) {
+    const fresh = new Map();
+    for (const v of (await vres.json()).verifications) fresh.set(v.id, newer(verifications.get(v.id), v));
+    verifications = fresh;
+  }
   render();
+}
+
+// shownStatus is a verification's status, expired once expires_at has passed
+// even before the server has stored that.
+const shownStatus = v => v.status === 'pending' && Date.parse(v.expires_at) <= Date.now() ? 'expired' : v.status;
+const tone = status => status === 'approved' ? 'approved' : status === 'pending' ? '' : 'ended';
+
+function badge(m) {
+  const v = verifications.get(m.verification_sid);
+  const status = v && shownStatus(v);
+  return el('span', { className: 'verification ' + (status ? tone(status) : ''), title: 'Verification ' + m.verification_sid },
+    [m.channel, status].filter(Boolean).join(' · '));
+}
+
+// scheduleExpiry re-renders when the soonest pending verification in the open
+// thread expires, so its badge turns to expired without an event.
+function scheduleExpiry(shown) {
+  clearTimeout(expiryTimer);
+  const now = Date.now();
+  const next = Math.min(...shown.filter(v => v.status === 'pending').map(v => Date.parse(v.expires_at)).filter(t => t > now));
+  if (Number.isFinite(next)) expiryTimer = setTimeout(render, Math.min(next - now, 2 ** 31 - 1));
 }
 
 function render() {
@@ -101,6 +140,7 @@ function render() {
   const thread = $('thread');
   $('reply').hidden = !current;
   if (!current) {
+    scheduleExpiry([]);
     thread.replaceChildren(el('div', { className: 'empty' }, 'No messages yet. Point your SMS provider SDK at this server, or try: ',
       el('br'), el('code', {}, `curl -d '{"to":"+15551234567","body":"Your code is 482913"}' ${location.origin}/api/v1/send`)));
     return;
@@ -110,6 +150,7 @@ function render() {
       el('span', {}, new Date(m.created_at).toLocaleTimeString()),
       el('span', { className: /failed|undelivered/.test(m.status) ? 'failed' : '' }, m.status),
       el('span', {}, `${m.provider} · ${m.encoding} · ${m.segments} segment${m.segments > 1 ? 's' : ''}`));
+    if (m.verification_sid) meta.append(badge(m));
     if (m.direction === 'outbound' && m.from) meta.append(el('span', {}, 'from ' + m.from));
     if (m.otp) meta.append(el('button', { className: 'otp', title: 'Copy code',
       onclick: e => { navigator.clipboard?.writeText(m.otp); e.target.textContent = 'copied'; setTimeout(() => e.target.textContent = m.otp, 800); } }, m.otp));
@@ -118,6 +159,7 @@ function render() {
     return el('div', { className: 'msg ' + m.direction }, m.body, meta);
   }));
   thread.scrollTop = thread.scrollHeight;
+  scheduleExpiry(groups.get(current).map(m => verifications.get(m.verification_sid)).filter(Boolean));
 }
 
 const setStatus = (id, status) => fetch(`/api/v1/messages/${id}/status`, {
@@ -133,7 +175,13 @@ $('reply').onsubmit = async e => {
 $('clear').onclick = () => fetch('/api/v1/messages', { method: 'DELETE' });
 $('search').oninput = load;
 
-new EventSource('/api/v1/events').onmessage = load;
+new EventSource('/api/v1/events').onmessage = e => {
+  const event = JSON.parse(e.data);
+  if (event.type !== 'verification') return load();
+  const v = event.verification;
+  verifications.set(v.id, newer(verifications.get(v.id), v));
+  render();
+};
 load();
 </script>
 </body>

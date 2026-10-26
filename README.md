@@ -60,6 +60,7 @@ Verification codes land in the Caduceus inbox instead of on a real phone. On `ve
 - Once a verification is approved, canceled, expired or out of check attempts, checking or fetching it answers `20404` (HTTP 404). Twilio documents a 404 for checking an approved, expired or out-of-attempts verification, which it deletes.
 - Other start parameters (`Locale`, `CustomMessage`, `CustomFriendlyName`, `TemplateSid`, `AppHash`, `Amount`, `Payee`, `RiskCheck`, `DeviceIp` and the rest) are accepted and ignored.
 - Verify captures are not Messaging resources: the Messages API does not list or fetch them.
+- In the web inbox, a Verify message shows its channel and its verification's status, such as `sms · pending`. The status updates as the verification is checked, canceled or expired, without a reload.
 - Not emulated, so passed through to Twilio: Services, Rate Limits, Messaging Configurations, Webhooks, Access Tokens and TOTP Entities, Factors and Challenges.
 
 Without the proxy, send to Caduceus directly:

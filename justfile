@@ -23,9 +23,13 @@ test *args:
     go test -race -count=1 ./... {{ args }}
 
 # Builds the binary and drives it through the HTTPS proxy, including with the
-# stock twilio Node SDK (needs node; installs its fixture on first run).
+# stock twilio Node SDK, and drives the inbox UI in headless Chromium. Needs
+# node; installs both fixtures on first run, and Chromium when it is missing
+# (with its system libraries when CI is set).
 e2e *args:
     [ -d e2e/twilio-node/node_modules ] || npm ci --prefix e2e/twilio-node --no-audit --no-fund
+    [ -d e2e/ui/node_modules ] || npm ci --prefix e2e/ui --no-audit --no-fund
+    cd e2e/ui && npx --no-install playwright install --only-shell --no-remove $([ -n "${CI:-}" ] && echo --with-deps) chromium
     go test -tags e2e -count=1 ./e2e/ {{ args }}
 
 # Meta recipes for agent ergonomics — keep these names; CI and the playbook
