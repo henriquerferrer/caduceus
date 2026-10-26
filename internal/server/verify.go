@@ -300,7 +300,10 @@ func (s *Server) verifyCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	code, to, sid := r.PostForm.Get("Code"), r.PostForm.Get("To"), r.PostForm.Get("VerificationSid")
 	switch {
-	case to == "" && sid == "":
+	// Twilio requires an E.164 phone number or an email address; without
+	// this a To in another format would match the pending verification by
+	// its digits alone.
+	case to == "" && sid == "", to != "" && !isE164(to) && !strings.Contains(to, "@"):
 		twilioError(w, http.StatusBadRequest, 60200, "Invalid parameter: To")
 		return
 	case code == "":

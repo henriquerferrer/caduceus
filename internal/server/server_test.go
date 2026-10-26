@@ -931,16 +931,49 @@ func TestVerifyCheckByVerificationSid(t *testing.T) {
 func TestVerifyCheckValidation(t *testing.T) {
 	ts := newTestServer(t)
 	_, v := startVerification(t, ts.URL, "VAx", url.Values{"To": {"+15550003335"}, "Channel": {"sms"}})
-	for _, form := range []url.Values{
-		{"Code": {"123456"}},
-		{"To": {"+15550003335"}},
-		{"VerificationSid": {v["sid"].(string)}},
-		{"To": {"+15550003335"}, "Code": {""}},
+	for _, c := range []struct {
+		form  url.Values
+		param string
+	}{
+		{url.Values{"Code": {"123456"}}, "To"},
+		{url.Values{"To": {"+15550003335"}}, "Code"},
+		{url.Values{"VerificationSid": {v["sid"].(string)}}, "Code"},
+		{url.Values{"To": {"+15550003335"}, "Code": {""}}, "Code"},
+		{url.Values{"To": {"15550003335"}, "Code": {"123456"}}, "To"},
+		{url.Values{"To": {"+1 (555) 000-3335"}, "Code": {"123456"}}, "To"},
 	} {
-		status, got := checkVerification(t, http.DefaultClient, ts.URL, "VAx", form)
-		if wantTwilioError(t, status, got, http.StatusBadRequest, 60200); t.Failed() {
-			t.Fatalf("form %v", form)
+		status, got := checkVerification(t, http.DefaultClient, ts.URL, "VAx", c.form)
+		if status != http.StatusBadRequest || got["code"] != float64(60200) || got["message"] != "Invalid parameter: "+c.param {
+			t.Errorf("form %v: got %d %v, want 400 code 60200 naming %s", c.form, status, got, c.param)
 		}
+	}
+}
+
+// A check's To must be E.164 or an email address, as Twilio's docs require:
+// a number in another format is refused rather than matched by its digits.
+func TestVerifyCheckToFormat(t *testing.T) {
+	ts := newTestServer(t)
+	st := ts.Config.Handler.(*Server).store
+	const to = "+15550003342"
+	_, v := startVerification(t, ts.URL, "VAx", url.Values{"To": {to}, "Channel": {"sms"}})
+	sid := v["sid"].(string)
+	code := sentCode(t, st, to)
+	for _, bad := range []string{"15550003342", "+1 (555) 000-3342"} {
+		status, got := checkVerification(t, http.DefaultClient, ts.URL, "VAx", url.Values{"To": {bad}, "Code": {code}})
+		if status != http.StatusBadRequest || got["code"] != float64(60200) {
+			t.Errorf("To %q: got %d %v, want 400 code 60200", bad, status, got)
+		}
+	}
+	stored, err := st.GetVerification(sid)
+	if err != nil || stored.Status != "pending" || stored.CheckAttempts != 0 {
+		t.Fatalf("verification changed: %+v, %v", stored, err)
+	}
+
+	const email = "Someone@Example.com"
+	startVerification(t, ts.URL, "VAx", url.Values{"To": {email}, "Channel": {"email"}})
+	status, got := checkVerification(t, http.DefaultClient, ts.URL, "VAx", url.Values{"To": {email}, "Code": {sentCode(t, st, email)}})
+	if status != http.StatusOK || got["status"] != "approved" {
+		t.Fatalf("email check: %d %v", status, got)
 	}
 }
 
@@ -983,6 +1016,8 @@ func TestVerifyCheckCanceled(t *testing.T) {
 		status, got := checkVerification(t, http.DefaultClient, ts.URL, "VAx", form)
 		wantTwilioError(t, status, got, http.StatusNotFound, 20404)
 	}
+	status, got := fetchVerification(t, http.DefaultClient, ts.URL, "VAx", sid)
+	wantTwilioError(t, status, got, http.StatusNotFound, 20404)
 }
 
 func TestVerifyCheckServiceScoping(t *testing.T) {
@@ -1025,6 +1060,8 @@ func TestVerifyCheckExpired(t *testing.T) {
 		status, got := checkVerification(t, http.DefaultClient, ts.URL, "VAx", form)
 		wantTwilioError(t, status, got, http.StatusNotFound, 20404)
 	}
+	status, got := fetchVerification(t, http.DefaultClient, ts.URL, "VAx", sid)
+	wantTwilioError(t, status, got, http.StatusNotFound, 20404)
 }
 
 func TestVerifyConcurrentChecks(t *testing.T) {
