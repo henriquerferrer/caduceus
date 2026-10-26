@@ -824,3 +824,263 @@ func TestTwilioMessagesExcludeVerify(t *testing.T) {
 		}
 	}
 }
+
+func checkURL(base, service string) string {
+	return base + "/v2/Services/" + service + "/VerificationCheck"
+}
+
+// checkVerification posts a VerificationCheck and decodes the response.
+func checkVerification(t *testing.T, c *http.Client, base, service string, form url.Values) (int, map[string]any) {
+	t.Helper()
+	resp := do(t, c, http.MethodPost, checkURL(base, service), "ACtest", form)
+	var out map[string]any
+	decode(t, resp, &out)
+	return resp.StatusCode, out
+}
+
+// fetchVerification gets one verification and decodes the response.
+func fetchVerification(t *testing.T, c *http.Client, base, service, sid string) (int, map[string]any) {
+	t.Helper()
+	resp := do(t, c, http.MethodGet, verificationsURL(base, service)+"/"+sid, "ACtest", nil)
+	var out map[string]any
+	decode(t, resp, &out)
+	return resp.StatusCode, out
+}
+
+// sentCode returns the code of the newest Verify message to a recipient.
+func sentCode(t *testing.T, st *store.Store, to string) string {
+	t.Helper()
+	msgs := verifyMessages(t, st, to)
+	if len(msgs) == 0 || msgs[0].OTP == "" {
+		t.Fatalf("no code captured for %s: %+v", to, msgs)
+	}
+	return msgs[0].OTP
+}
+
+// wrongCode returns a code that differs from code.
+func wrongCode(code string) string {
+	if code == "000000" {
+		return "111111"
+	}
+	return "000000"
+}
+
+func TestVerifyCheckThroughProxy(t *testing.T) {
+	st, client, _ := newProxy(t)
+	const base, to = "https://verify.twilio.com", "+15550003333"
+	resp := do(t, client, http.MethodPost, verificationsURL(base, "VAx"), "ACtest", url.Values{"To": {to}, "Channel": {"sms"}})
+	var v map[string]any
+	decode(t, resp, &v)
+	sid, _ := v["sid"].(string)
+	code := sentCode(t, st, to)
+
+	status, got := checkVerification(t, client, base, "VAx", url.Values{"To": {to}, "Code": {wrongCode(code)}})
+	if status != http.StatusOK || got["status"] != "pending" || got["valid"] != false || got["sid"] != sid {
+		t.Fatalf("wrong code: %d %v", status, got)
+	}
+	status, got = checkVerification(t, client, base, "VAx", url.Values{"To": {to}, "Code": {code}})
+	if status != http.StatusOK || got["status"] != "approved" || got["valid"] != true || got["sid"] != sid {
+		t.Fatalf("right code: %d %v", status, got)
+	}
+	if got["service_sid"] != "VAx" || got["account_sid"] != "ACtest" || got["to"] != to || got["channel"] != "sms" ||
+		got["amount"] != nil || got["payee"] != nil {
+		t.Fatalf("resource fields: %v", got)
+	}
+	if codes, ok := got["sna_attempts_error_codes"].([]any); !ok || len(codes) != 0 {
+		t.Fatalf("sna_attempts_error_codes = %#v", got["sna_attempts_error_codes"])
+	}
+	for _, field := range []string{"date_created", "date_updated"} {
+		if s, _ := got[field].(string); !isISO8601(s) {
+			t.Fatalf("%s = %v, want ISO 8601", field, got[field])
+		}
+	}
+
+	status, got = checkVerification(t, client, base, "VAx", url.Values{"To": {to}, "Code": {code}})
+	wantTwilioError(t, status, got, http.StatusNotFound, 20404)
+	status, got = fetchVerification(t, client, base, "VAx", sid)
+	wantTwilioError(t, status, got, http.StatusNotFound, 20404)
+}
+
+func isISO8601(s string) bool {
+	_, err := time.Parse("2006-01-02T15:04:05Z", s)
+	return err == nil
+}
+
+func TestVerifyCheckByVerificationSid(t *testing.T) {
+	ts := newTestServer(t)
+	st := ts.Config.Handler.(*Server).store
+	const to = "+15550003334"
+	_, v := startVerification(t, ts.URL, "VAx", url.Values{"To": {to}, "Channel": {"sms"}})
+	sid := v["sid"].(string)
+	code := sentCode(t, st, to)
+
+	status, got := checkVerification(t, http.DefaultClient, ts.URL, "VAx", url.Values{"VerificationSid": {sid}, "Code": {wrongCode(code)}})
+	if status != http.StatusOK || got["status"] != "pending" || got["valid"] != false || got["sid"] != sid {
+		t.Fatalf("wrong code: %d %v", status, got)
+	}
+	status, got = checkVerification(t, http.DefaultClient, ts.URL, "VAx", url.Values{"VerificationSid": {sid}, "Code": {code}})
+	if status != http.StatusOK || got["status"] != "approved" || got["valid"] != true || got["sid"] != sid {
+		t.Fatalf("right code: %d %v", status, got)
+	}
+	status, got = checkVerification(t, http.DefaultClient, ts.URL, "VAx", url.Values{"VerificationSid": {sid}, "Code": {code}})
+	wantTwilioError(t, status, got, http.StatusNotFound, 20404)
+	status, got = fetchVerification(t, http.DefaultClient, ts.URL, "VAx", sid)
+	wantTwilioError(t, status, got, http.StatusNotFound, 20404)
+}
+
+func TestVerifyCheckValidation(t *testing.T) {
+	ts := newTestServer(t)
+	_, v := startVerification(t, ts.URL, "VAx", url.Values{"To": {"+15550003335"}, "Channel": {"sms"}})
+	for _, form := range []url.Values{
+		{"Code": {"123456"}},
+		{"To": {"+15550003335"}},
+		{"VerificationSid": {v["sid"].(string)}},
+		{"To": {"+15550003335"}, "Code": {""}},
+	} {
+		status, got := checkVerification(t, http.DefaultClient, ts.URL, "VAx", form)
+		if wantTwilioError(t, status, got, http.StatusBadRequest, 60200); t.Failed() {
+			t.Fatalf("form %v", form)
+		}
+	}
+}
+
+func TestVerifyCheckAttemptLimit(t *testing.T) {
+	ts := newTestServer(t)
+	st := ts.Config.Handler.(*Server).store
+	const to = "+15550003336"
+	_, v := startVerification(t, ts.URL, "VAx", url.Values{"To": {to}, "Channel": {"sms"}})
+	sid := v["sid"].(string)
+	code := sentCode(t, st, to)
+	wrong := url.Values{"To": {to}, "Code": {wrongCode(code)}}
+
+	for i := range store.MaxCheckAttempts {
+		if status, got := checkVerification(t, http.DefaultClient, ts.URL, "VAx", wrong); status != http.StatusOK || got["status"] != "pending" {
+			t.Fatalf("wrong check %d: %d %v", i+1, status, got)
+		}
+	}
+	status, got := checkVerification(t, http.DefaultClient, ts.URL, "VAx", url.Values{"To": {to}, "Code": {code}})
+	wantTwilioError(t, status, got, http.StatusTooManyRequests, 60202)
+	stored, err := st.GetVerification(sid)
+	if err != nil || stored.Status != "max_attempts_reached" || stored.CheckAttempts != store.MaxCheckAttempts {
+		t.Fatalf("stored %+v, %v", stored, err)
+	}
+
+	status, got = checkVerification(t, http.DefaultClient, ts.URL, "VAx", url.Values{"VerificationSid": {sid}, "Code": {code}})
+	wantTwilioError(t, status, got, http.StatusNotFound, 20404)
+	status, got = fetchVerification(t, http.DefaultClient, ts.URL, "VAx", sid)
+	wantTwilioError(t, status, got, http.StatusNotFound, 20404)
+}
+
+func TestVerifyCheckCanceled(t *testing.T) {
+	ts := newTestServer(t)
+	st := ts.Config.Handler.(*Server).store
+	const to = "+15550003337"
+	_, v := startVerification(t, ts.URL, "VAx", url.Values{"To": {to}, "Channel": {"sms"}})
+	sid := v["sid"].(string)
+	code := sentCode(t, st, to)
+	do(t, http.DefaultClient, http.MethodPost, verificationsURL(ts.URL, "VAx")+"/"+sid, "ACtest", url.Values{"Status": {"canceled"}}).Body.Close()
+	for _, form := range []url.Values{{"To": {to}, "Code": {code}}, {"VerificationSid": {sid}, "Code": {code}}} {
+		status, got := checkVerification(t, http.DefaultClient, ts.URL, "VAx", form)
+		wantTwilioError(t, status, got, http.StatusNotFound, 20404)
+	}
+}
+
+func TestVerifyCheckServiceScoping(t *testing.T) {
+	ts := newTestServer(t)
+	st := ts.Config.Handler.(*Server).store
+	const to = "+15550003338"
+	_, v := startVerification(t, ts.URL, "VAone", url.Values{"To": {to}, "Channel": {"sms"}})
+	sid := v["sid"].(string)
+	code := sentCode(t, st, to)
+	before, err := st.GetVerification(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, form := range []url.Values{{"VerificationSid": {sid}, "Code": {code}}, {"To": {to}, "Code": {code}}} {
+		status, got := checkVerification(t, http.DefaultClient, ts.URL, "VAother", form)
+		wantTwilioError(t, status, got, http.StatusNotFound, 20404)
+	}
+	after, err := st.GetVerification(sid)
+	if err != nil || after.Status != "pending" || after.CheckAttempts != 0 || !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("verification changed: %+v, %v", after, err)
+	}
+}
+
+func TestVerifyCheckExpired(t *testing.T) {
+	ts := newTestServer(t)
+	st := ts.Config.Handler.(*Server).store
+	const to = "+15550003339"
+	_, v := startVerification(t, ts.URL, "VAx", url.Values{"To": {to}, "Channel": {"sms"}})
+	sid := v["sid"].(string)
+	code := sentCode(t, st, to)
+	stored, err := st.GetVerification(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored.ExpiresAt = time.Now().Add(-time.Minute)
+	if _, err := st.UpdateVerification(stored); err != nil {
+		t.Fatal(err)
+	}
+	for _, form := range []url.Values{{"To": {to}, "Code": {code}}, {"VerificationSid": {sid}, "Code": {code}}} {
+		status, got := checkVerification(t, http.DefaultClient, ts.URL, "VAx", form)
+		wantTwilioError(t, status, got, http.StatusNotFound, 20404)
+	}
+}
+
+func TestVerifyConcurrentChecks(t *testing.T) {
+	ts := newTestServer(t)
+	st := ts.Config.Handler.(*Server).store
+	const to = "+15550003340"
+	_, v := startVerification(t, ts.URL, "VAx", url.Values{"To": {to}, "Channel": {"sms"}})
+	sid := v["sid"].(string)
+	wrong := url.Values{"To": {to}, "Code": {wrongCode(sentCode(t, st, to))}}
+	statuses := make(chan int, 10)
+	for range 10 {
+		go func() {
+			// No t.Fatal off the test goroutine: report and send a zero status.
+			resp, err := http.PostForm(checkURL(ts.URL, "VAx"), wrong)
+			if err != nil {
+				t.Error(err)
+				statuses <- 0
+				return
+			}
+			resp.Body.Close()
+			statuses <- resp.StatusCode
+		}()
+	}
+	counts := map[int]int{}
+	for range 10 {
+		counts[<-statuses]++
+	}
+	if counts[http.StatusOK] != store.MaxCheckAttempts || counts[http.StatusTooManyRequests] != 1 || counts[http.StatusNotFound] != 10-store.MaxCheckAttempts-1 {
+		t.Fatalf("statuses %v", counts)
+	}
+	stored, err := st.GetVerification(sid)
+	if err != nil || stored.CheckAttempts > store.MaxCheckAttempts || stored.Status != "max_attempts_reached" {
+		t.Fatalf("stored %+v, %v", stored, err)
+	}
+}
+
+// The check route answers on the local base URL; through the proxy only the
+// verify host emulates it, so a check sent to api.twilio.com reaches Twilio.
+func TestVerifyCheckOnBaseURLAndPassThrough(t *testing.T) {
+	ts := newTestServer(t)
+	st := ts.Config.Handler.(*Server).store
+	const to = "+15550003341"
+	startVerification(t, ts.URL, "VAx", url.Values{"To": {to}, "Channel": {"sms"}})
+	status, got := checkVerification(t, http.DefaultClient, ts.URL, "VAx", url.Values{"To": {to}, "Code": {sentCode(t, st, to)}})
+	if status != http.StatusOK || got["status"] != "approved" {
+		t.Fatalf("base URL check: %d %v", status, got)
+	}
+
+	_, client, seen := newProxy(t)
+	resp := do(t, client, http.MethodPost, checkURL("https://api.twilio.com", "VAx"), "ACtest", url.Values{"To": {to}, "Code": {"123456"}})
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "real twilio" {
+		t.Fatalf("check on api.twilio.com answered %d %s, want the upstream", resp.StatusCode, body)
+	}
+	if got, want := <-seen, "POST api.twilio.com/v2/Services/VAx/VerificationCheck as ACtest"; got != want {
+		t.Fatalf("upstream saw %q, want %q", got, want)
+	}
+}

@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"math/big"
@@ -35,6 +36,7 @@ func (s *Server) verifyRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v2/Services/{service}/Verifications", s.verifyStart)
 	mux.HandleFunc("GET /v2/Services/{service}/Verifications/{sid}", s.verifyFetch)
 	mux.HandleFunc("POST /v2/Services/{service}/Verifications/{sid}", s.verifyUpdate)
+	mux.HandleFunc("POST /v2/Services/{service}/VerificationCheck", s.verifyCheck)
 }
 
 // twilioVerification renders v as Twilio's Verification resource. Its url
@@ -208,7 +210,9 @@ func (s *Server) verifyFetch(w http.ResponseWriter, r *http.Request) {
 	s.verifyMu.Lock()
 	defer s.verifyMu.Unlock()
 	v, err := s.serviceVerification(r)
-	if errors.Is(err, store.ErrNotFound) {
+	// Twilio deletes a verification once it is approved, expired or out of
+	// check attempts; here any verification that is not pending is gone.
+	if errors.Is(err, store.ErrNotFound) || (err == nil && v.Status != "pending") {
 		twilioNotFound(w, r)
 		return
 	}
@@ -247,4 +251,86 @@ func (s *Server) verifyUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, twilioVerification(r, v))
+}
+
+// twilioVerificationCheck renders v as Twilio's VerificationCheck resource.
+func twilioVerificationCheck(v store.Verification) map[string]any {
+	return map[string]any{
+		"sid":                      v.ID,
+		"service_sid":              v.ServiceSID,
+		"account_sid":              v.AccountSID,
+		"to":                       v.To,
+		"channel":                  v.Channel,
+		"status":                   v.Status,
+		"valid":                    v.Status == "approved",
+		"amount":                   nil,
+		"payee":                    nil,
+		"date_created":             v.CreatedAt.UTC().Format(verifyTime),
+		"date_updated":             v.UpdatedAt.UTC().Format(verifyTime),
+		"sna_attempts_error_codes": []any{},
+	}
+}
+
+// checkTarget returns the live pending verification a check names: by
+// VerificationSid when one is sent, else the newest pending one to To. A
+// verification on another service is not found.
+func (s *Server) checkTarget(service, sid, to string) (store.Verification, error) {
+	if sid == "" {
+		return s.store.PendingVerification(service, to)
+	}
+	v, err := s.store.GetVerification(sid)
+	if err == nil && (v.ServiceSID != service || v.Status != "pending") {
+		return store.Verification{}, store.ErrNotFound
+	}
+	return v, err
+}
+
+// verifyCheck checks a code against a pending verification. Each check
+// answered 200 counts one attempt; the check after MaxCheckAttempts is
+// refused with 60202, is not counted, and ends the verification.
+func (s *Server) verifyCheck(w http.ResponseWriter, r *http.Request) {
+	service := r.PathValue("service")
+	if !strings.HasPrefix(service, "VA") {
+		twilioNotFound(w, r)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		twilioError(w, http.StatusBadRequest, 20001, "Could not parse the request body.")
+		return
+	}
+	code, to, sid := r.PostForm.Get("Code"), r.PostForm.Get("To"), r.PostForm.Get("VerificationSid")
+	switch {
+	case to == "" && sid == "":
+		twilioError(w, http.StatusBadRequest, 60200, "Invalid parameter: To")
+		return
+	case code == "":
+		twilioError(w, http.StatusBadRequest, 60200, "Invalid parameter: Code")
+		return
+	}
+
+	s.verifyMu.Lock()
+	defer s.verifyMu.Unlock()
+	v, err := s.checkTarget(service, sid, to)
+	if err != nil {
+		s.twilioFail(w, r, err)
+		return
+	}
+	if v.CheckAttempts >= store.MaxCheckAttempts {
+		v.Status = "max_attempts_reached"
+		if _, err := s.store.UpdateVerification(v); err != nil {
+			s.twilioFail(w, r, err)
+			return
+		}
+		twilioError(w, http.StatusTooManyRequests, 60202, "Max check attempts reached")
+		return
+	}
+	v.CheckAttempts++
+	if subtle.ConstantTimeCompare([]byte(code), []byte(v.Code)) == 1 {
+		v.Status = "approved"
+	}
+	if v, err = s.store.UpdateVerification(v); err != nil {
+		s.twilioFail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, twilioVerificationCheck(v))
 }
