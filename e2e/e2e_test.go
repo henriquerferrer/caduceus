@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -144,6 +145,80 @@ func TestTwilioNodeSDK(t *testing.T) {
 	}
 	if got := c.wait(t, to)["otp"]; got != "771204" {
 		t.Fatalf("otp = %v, want 771204", got)
+	}
+}
+
+// verifyNode runs one verify.mjs subcommand through the stock twilio Node SDK,
+// configured only by environment, and decodes the JSON it prints.
+func verifyNode(t *testing.T, c instance, args ...string) map[string]any {
+	t.Helper()
+	cmd := exec.Command("node", append([]string{"verify.mjs"}, args...)...)
+	cmd.Dir = "twilio-node"
+	cmd.Env = append(os.Environ(),
+		"HTTP_PROXY="+c.base,
+		"HTTPS_PROXY="+c.base,
+		"NODE_EXTRA_CA_CERTS="+c.caPath,
+	)
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("verify.mjs %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatalf("verify.mjs %s printed %q: %v", strings.Join(args, " "), out, err)
+	}
+	return m
+}
+
+// The official twilio Node SDK, unmodified and configured only by
+// environment, starts and checks a Twilio Verify verification.
+func TestTwilioNodeSDKVerify(t *testing.T) {
+	if _, err := os.Stat("twilio-node/node_modules/twilio"); err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatal("twilio-node is not installed; run npm ci in e2e/twilio-node")
+		}
+		t.Skip("run `npm ci` in e2e/twilio-node to enable")
+	}
+	c := start(t)
+	to := "+15550003333"
+
+	started := verifyNode(t, c, "start", to)
+	sid, _ := started["sid"].(string)
+	if !strings.HasPrefix(sid, "VE") || started["status"] != "pending" || started["valid"] != false {
+		t.Fatalf("start = %v, want a VE sid, pending, not valid", started)
+	}
+	created, err := time.Parse(time.RFC3339, fmt.Sprint(started["dateCreated"]))
+	if err != nil || time.Since(created).Abs() > time.Minute {
+		t.Fatalf("start dateCreated = %v, want a time near now (%v)", started["dateCreated"], err)
+	}
+
+	msg := c.wait(t, to)
+	code, _ := msg["otp"].(string)
+	if code == "" || msg["verification_sid"] != sid {
+		t.Fatalf("wait = %v, want the code of verification %s", msg, sid)
+	}
+
+	// A second start before any check resends the same verification.
+	if again := verifyNode(t, c, "start", to); again["sid"] != sid || again["status"] != "pending" {
+		t.Fatalf("second start = %v, want sid %s, pending", again, sid)
+	}
+
+	wrong := "000000"
+	if code == wrong {
+		wrong = "111111"
+	}
+	if got := verifyNode(t, c, "check", to, wrong); got["status"] != "pending" || got["valid"] != false {
+		t.Fatalf("check with a wrong code = %v, want pending, not valid", got)
+	}
+	if got := verifyNode(t, c, "check", to, code); got["sid"] != sid || got["status"] != "approved" || got["valid"] != true {
+		t.Fatalf("check with the code = %v, want %s approved, valid", got, sid)
+	}
+
+	// The verification is gone once approved: the SDK parses Twilio's error.
+	got := verifyNode(t, c, "check", to, code)
+	if e, _ := got["restException"].(map[string]any); e == nil || e["status"] != float64(404) || e["code"] != float64(20404) {
+		t.Fatalf("check after approval = %v, want a RestException 404 / 20404", got)
 	}
 }
 
