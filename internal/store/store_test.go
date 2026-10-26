@@ -174,16 +174,30 @@ func TestVerificationRoundTripsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := newVerification(t, s, "VAone", "+15551234567")
+	added := newVerification(t, s, "VAone", "+15551234567")
+	// AddVerification's return is built from its input, not read back, so
+	// comparing a read with it checks every column the add wrote.
+	if got, err := s.GetVerification(added.ID); err != nil || !reflect.DeepEqual(got, added) {
+		t.Fatalf("read after add: got %+v, %v; want %+v", got, err, added)
+	}
+	want := added
 	want.CheckAttempts = 2
-	want.SendAttempts = append(want.SendAttempts, SendAttempt{SID: NewSID("VL"), Channel: "call", Time: time.Now()})
+	want.SendAttempts = append(want.SendAttempts, SendAttempt{SID: NewSID("VL"), Channel: "call", Time: time.Unix(1_800_000_000, 5).UTC()})
 	want.Channel = "call"
-	want, err = s.UpdateVerification(want)
+	want.Code = "654321"
+	updated, err := s.UpdateVerification(want)
 	if err != nil {
 		t.Fatal(err)
 	}
+	want.UpdatedAt = updated.UpdatedAt
+	if !reflect.DeepEqual(updated, want) {
+		t.Fatalf("read after update: got %+v; want %+v", updated, want)
+	}
 	if want.ExpiresAt.Sub(want.CreatedAt) != VerificationTTL || len(want.SendAttempts) != 2 {
 		t.Fatalf("added %+v", want)
+	}
+	if want.AccountSID != "AC00000000000000000000000000000000" || want.To != "+15551234567" || want.Status != "pending" {
+		t.Fatalf("input fields lost: %+v", want)
 	}
 	s.Close()
 
@@ -356,6 +370,59 @@ func TestExpiryDoesNotOverwriteConcurrentWrite(t *testing.T) {
 		t.Fatalf("got %+v, %v", got, err)
 	}
 	noEvent(t, events)
+}
+
+// deleteOnFirstNow makes the store's clock delete the verification with that
+// id the first time it is read, standing in for a Clear or a prune that runs
+// between a read's query and its expiry write.
+func deleteOnFirstNow(t *testing.T, s *Store, now time.Time, id string) {
+	t.Helper()
+	deleted := false
+	s.now = func() time.Time {
+		if !deleted {
+			deleted = true
+			if _, err := s.db.Exec(`DELETE FROM verifications WHERE id = ?`, id); err != nil {
+				t.Errorf("delete: %v", err)
+			}
+		}
+		return now
+	}
+}
+
+// A row deleted after a read's query but before its expiry write is absent:
+// the read leaves it out instead of failing.
+func TestReadsSkipVerificationDeletedBeforeExpiry(t *testing.T) {
+	s, err := Open("", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Unix(1_800_000_000, 0).UTC()
+	s.now = func() time.Time { return now }
+
+	older := newVerification(t, s, "VAone", "+15551234567")
+	newer := newVerification(t, s, "VAone", "+15551234567")
+	newer.ExpiresAt = now.Add(-time.Second)
+	if _, err := s.UpdateVerification(newer); err != nil {
+		t.Fatal(err)
+	}
+
+	deleteOnFirstNow(t, s, now, newer.ID)
+	list, err := s.ListVerifications(Filter{})
+	if err != nil || len(list) != 1 || list[0].ID != older.ID {
+		t.Fatalf("ListVerifications: got %+v, %v; want only %s", list, err, older.ID)
+	}
+
+	gone := newVerification(t, s, "VAone", "+15551234567")
+	gone.ExpiresAt = now.Add(-time.Second)
+	if _, err := s.UpdateVerification(gone); err != nil {
+		t.Fatal(err)
+	}
+	deleteOnFirstNow(t, s, now, gone.ID)
+	got, err := s.PendingVerification("VAone", "+15551234567")
+	if err != nil || got.ID != older.ID {
+		t.Fatalf("PendingVerification: got %+v, %v; want %s", got, err, older.ID)
+	}
 }
 
 func TestClearAndPruneVerifications(t *testing.T) {

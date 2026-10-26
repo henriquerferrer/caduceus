@@ -146,7 +146,8 @@ func (s *Store) getVerification(id string) (Verification, error) {
 // as expired, and returns the verification's current state. The write is
 // conditional on the stored row still being pending and past its expiry, so it
 // never overwrites a write made after v was read; the event is published only
-// when that write changed the row.
+// when that write changed the row. It returns ErrNotFound when the row was
+// deleted after v was read.
 func (s *Store) applyExpiry(v Verification) (Verification, error) {
 	now := stamp(s.now())
 	if v.Status != "pending" || now.Before(v.ExpiresAt) {
@@ -215,12 +216,18 @@ func (s *Store) ListVerifications(f Filter) ([]Verification, error) {
 	if err != nil {
 		return nil, err
 	}
-	for i := range vs {
-		if vs[i], err = s.applyExpiry(vs[i]); err != nil {
+	out := vs[:0]
+	for _, v := range vs {
+		cur, err := s.applyExpiry(v)
+		if errors.Is(err, ErrNotFound) {
+			continue // deleted since the query: absent now, so not listed
+		}
+		if err != nil {
 			return nil, err
 		}
+		out = append(out, cur)
 	}
-	return vs, nil
+	return out, nil
 }
 
 // PendingVerification returns the newest verification on that service to that
@@ -238,6 +245,9 @@ func (s *Store) PendingVerification(serviceSID, to string) (Verification, error)
 	}
 	for _, v := range vs {
 		cur, err := s.applyExpiry(v)
+		if errors.Is(err, ErrNotFound) {
+			continue // deleted since the query: try the next candidate
+		}
 		if err != nil {
 			return Verification{}, err
 		}
