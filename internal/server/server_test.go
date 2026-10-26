@@ -1276,3 +1276,37 @@ func TestWaitForEmailRecipient(t *testing.T) {
 		t.Fatalf("?to=nobody: %d %v", status, e)
 	}
 }
+
+// A message to an email address that arrives while wait is blocked is matched
+// by recipient too, not just the one already stored when wait was called.
+func TestWaitBlocksUntilEmailMessageArrives(t *testing.T) {
+	ts := newTestServer(t)
+	got := make(chan store.Message, 1)
+	go func() {
+		var m store.Message
+		if status := apiJSON(t, http.MethodGet, ts.URL+"/api/v1/wait?timeout=5s&to="+url.QueryEscape("ada@example.com"), &m); status != http.StatusOK {
+			t.Errorf("wait: %d", status)
+		}
+		got <- m
+	}()
+	time.Sleep(50 * time.Millisecond)
+	for _, body := range []string{
+		`{"to":"grace@example.com","body":"other address 111111"}`,
+		`{"to":"+15551234567","body":"a number 222222"}`,
+		`{"to":"Ada@Example.com","body":"Your code is 482913"}`,
+	} {
+		resp, err := http.Post(ts.URL+"/api/v1/send", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+	select {
+	case m := <-got:
+		if m.OTP != "482913" || !strings.EqualFold(m.To, "ada@example.com") {
+			t.Fatalf("got %+v", m)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("wait did not return")
+	}
+}
