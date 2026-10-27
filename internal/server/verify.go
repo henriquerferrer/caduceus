@@ -142,46 +142,52 @@ func (s *Server) verifyStart(w http.ResponseWriter, r *http.Request) {
 	s.verifyMu.Lock()
 	defer s.verifyMu.Unlock()
 	attempt := store.SendAttempt{SID: store.NewSID("VL"), Channel: channel, Time: time.Now()}
-	v, err := s.store.PendingVerification(service, to)
-	isNew := errors.Is(err, store.ErrNotFound)
-	switch {
-	case err == nil:
-		if len(v.SendAttempts) >= store.MaxSendAttempts {
-			twilioError(w, http.StatusTooManyRequests, 60203, "Max send attempts reached")
-			return
-		}
-		v.Channel = channel
-		v.SendAttempts = append(v.SendAttempts, attempt)
-	case isNew:
-		code := r.PostForm.Get("CustomCode")
-		if code == "" {
-			if code, err = randomCode(); err != nil {
-				s.twilioFail(w, r, err)
+	for {
+		v, err := s.store.PendingVerification(service, to)
+		isNew := errors.Is(err, store.ErrNotFound)
+		switch {
+		case err == nil:
+			if len(v.SendAttempts) >= store.MaxSendAttempts {
+				twilioError(w, http.StatusTooManyRequests, 60203, "Max send attempts reached")
 				return
 			}
+			v.Channel = channel
+			v.SendAttempts = append(v.SendAttempts, attempt)
+		case isNew:
+			code := r.PostForm.Get("CustomCode")
+			if code == "" {
+				if code, err = randomCode(); err != nil {
+					s.twilioFail(w, r, err)
+					return
+				}
+			}
+			v = store.Verification{
+				ID: store.NewSID("VE"), ServiceSID: service, AccountSID: accountSID(r),
+				To: to, Channel: channel, Code: code, Status: "pending",
+				SendAttempts: []store.SendAttempt{attempt},
+			}
+		default:
+			s.twilioFail(w, r, err)
+			return
 		}
-		v = store.Verification{
-			ID: store.NewSID("VE"), ServiceSID: service, AccountSID: accountSID(r),
-			To: to, Channel: channel, Code: code, Status: "pending",
-			SendAttempts: []store.SendAttempt{attempt},
+		// The verification and the message carrying its code are stored together:
+		// a send that fails uses up no attempt and leaves no code in the inbox.
+		v, m, err := s.store.SendVerification(v, isNew, outbound(store.Message{
+			Provider: verifyProvider, AccountSID: v.AccountSID, From: "Verify", To: v.To,
+			Body: "Your verification code is: " + v.Code, OTP: v.Code,
+			Channel: channel, VerificationSID: v.ID,
+		}))
+		if errors.Is(err, store.ErrStale) {
+			continue // see verifyMu: start again from the current state
 		}
-	default:
-		s.twilioFail(w, r, err)
+		if err != nil {
+			s.twilioFail(w, r, err)
+			return
+		}
+		s.captured(m)
+		writeJSON(w, http.StatusCreated, twilioVerification(r, v))
 		return
 	}
-	// The verification and the message carrying its code are stored together:
-	// a send that fails uses up no attempt and leaves no code in the inbox.
-	v, m, err := s.store.SendVerification(v, isNew, outbound(store.Message{
-		Provider: verifyProvider, AccountSID: v.AccountSID, From: "Verify", To: v.To,
-		Body: "Your verification code is: " + v.Code, OTP: v.Code,
-		Channel: channel, VerificationSID: v.ID,
-	}))
-	if err != nil {
-		s.twilioFail(w, r, err)
-		return
-	}
-	s.captured(m)
-	writeJSON(w, http.StatusCreated, twilioVerification(r, v))
 }
 
 // twilioFail answers a Verify request whose storage failed: 20404 when the
@@ -236,21 +242,29 @@ func (s *Server) verifyUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	s.verifyMu.Lock()
 	defer s.verifyMu.Unlock()
-	v, err := s.serviceVerification(r)
-	if errors.Is(err, store.ErrNotFound) || (err == nil && v.Status != "pending") {
-		twilioNotFound(w, r)
+	for {
+		v, err := s.serviceVerification(r)
+		if errors.Is(err, store.ErrNotFound) || (err == nil && v.Status != "pending") {
+			twilioNotFound(w, r)
+			return
+		}
+		if err != nil {
+			s.twilioFail(w, r, err)
+			return
+		}
+		from := v.Status
+		v.Status = status
+		v, err = s.store.UpdateVerification(v, from)
+		if errors.Is(err, store.ErrStale) {
+			continue // see verifyMu: answer from the current state
+		}
+		if err != nil {
+			s.twilioFail(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, twilioVerification(r, v))
 		return
 	}
-	if err != nil {
-		s.twilioFail(w, r, err)
-		return
-	}
-	v.Status = status
-	if v, err = s.store.UpdateVerification(v); err != nil {
-		s.twilioFail(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, twilioVerification(r, v))
 }
 
 // twilioVerificationCheck renders v as Twilio's VerificationCheck resource.
@@ -313,27 +327,39 @@ func (s *Server) verifyCheck(w http.ResponseWriter, r *http.Request) {
 
 	s.verifyMu.Lock()
 	defer s.verifyMu.Unlock()
-	v, err := s.checkTarget(service, sid, to)
-	if err != nil {
-		s.twilioFail(w, r, err)
-		return
-	}
-	if v.CheckAttempts >= store.MaxCheckAttempts {
-		v.Status = "max_attempts_reached"
-		if _, err := s.store.UpdateVerification(v); err != nil {
+	for {
+		v, err := s.checkTarget(service, sid, to)
+		if err != nil {
 			s.twilioFail(w, r, err)
 			return
 		}
-		twilioError(w, http.StatusTooManyRequests, 60202, "Max check attempts reached")
+		from := v.Status
+		if v.CheckAttempts >= store.MaxCheckAttempts {
+			v.Status = "max_attempts_reached"
+			_, err := s.store.UpdateVerification(v, from)
+			if errors.Is(err, store.ErrStale) {
+				continue // see verifyMu: answer from the current state
+			}
+			if err != nil {
+				s.twilioFail(w, r, err)
+				return
+			}
+			twilioError(w, http.StatusTooManyRequests, 60202, "Max check attempts reached")
+			return
+		}
+		v.CheckAttempts++
+		if subtle.ConstantTimeCompare([]byte(code), []byte(v.Code)) == 1 {
+			v.Status = "approved"
+		}
+		v, err = s.store.UpdateVerification(v, from)
+		if errors.Is(err, store.ErrStale) {
+			continue // see verifyMu: answer from the current state
+		}
+		if err != nil {
+			s.twilioFail(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, twilioVerificationCheck(v))
 		return
 	}
-	v.CheckAttempts++
-	if subtle.ConstantTimeCompare([]byte(code), []byte(v.Code)) == 1 {
-		v.Status = "approved"
-	}
-	if v, err = s.store.UpdateVerification(v); err != nil {
-		s.twilioFail(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, twilioVerificationCheck(v))
 }

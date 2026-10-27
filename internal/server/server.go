@@ -50,6 +50,11 @@ type Server struct {
 	// clear that deletes verifications, so concurrent requests never create
 	// two pending verifications, lose an attempt or lose their verification
 	// between its read and its write.
+	//
+	// The REST reads of verifications store an expiry without taking it, so a
+	// handler's write is conditional on the status the handler read
+	// (store.UpdateVerification). A write that returns store.ErrStale changed
+	// nothing: the handler reads again and answers from the current state.
 	verifyMu sync.Mutex
 	upstream *httputil.ReverseProxy
 	// direct reaches real servers for proxied traffic Caduceus doesn't capture.
@@ -378,26 +383,33 @@ func (s *Server) handleGetVerification(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleExpireVerification(w http.ResponseWriter, r *http.Request) {
 	s.verifyMu.Lock()
 	defer s.verifyMu.Unlock()
-	v, err := s.store.GetVerification(r.PathValue("sid"))
-	if err != nil {
-		s.failVerification(w, err)
+	for {
+		v, err := s.store.GetVerification(r.PathValue("sid"))
+		if err != nil {
+			s.failVerification(w, err)
+			return
+		}
+		if v.Status != "pending" {
+			writeError(w, http.StatusConflict, "verification is "+v.Status+", not pending")
+			return
+		}
+		v.ExpiresAt = time.Now()
+		_, err = s.store.UpdateVerification(v, v.Status)
+		if errors.Is(err, store.ErrStale) {
+			continue // see verifyMu: answer from the current state
+		}
+		if err != nil {
+			s.failVerification(w, err)
+			return
+		}
+		// Reading it back applies the expiry, storing the status as expired.
+		if v, err = s.store.GetVerification(v.ID); err != nil {
+			s.failVerification(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, v)
 		return
 	}
-	if v.Status != "pending" {
-		writeError(w, http.StatusConflict, "verification is "+v.Status+", not pending")
-		return
-	}
-	v.ExpiresAt = time.Now()
-	if _, err := s.store.UpdateVerification(v); err != nil {
-		s.failVerification(w, err)
-		return
-	}
-	// Reading it back applies the expiry, storing the status as expired.
-	if v, err = s.store.GetVerification(v.ID); err != nil {
-		s.failVerification(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, v)
 }
 
 // handleWait returns the newest outbound message to a number or an email

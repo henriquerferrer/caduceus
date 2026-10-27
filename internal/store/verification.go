@@ -116,8 +116,14 @@ func (s *Store) insertVerification(db execer, v Verification) (Verification, err
 // UpdateVerification writes v's Channel, Code, Status, SendAttempts,
 // CheckAttempts and ExpiresAt, sets UpdatedAt to now, and returns the
 // verification as stored. Expiry is not applied to the returned value.
-func (s *Store) UpdateVerification(v Verification) (Verification, error) {
-	got, err := s.updateVerification(s.db, v)
+//
+// The write is conditional on the stored status still being from, the status
+// the caller read: a status stored since that read, an expiry for one, is not
+// overwritten. When the row's status is no longer from, it returns ErrStale;
+// when the row is gone, ErrNotFound. Either way nothing is written or
+// published.
+func (s *Store) UpdateVerification(v Verification, from string) (Verification, error) {
+	got, err := s.updateVerification(s.db, v, from)
 	if err != nil {
 		return Verification{}, err
 	}
@@ -125,22 +131,28 @@ func (s *Store) UpdateVerification(v Verification) (Verification, error) {
 	return got, nil
 }
 
-func (s *Store) updateVerification(db execer, v Verification) (Verification, error) {
+func (s *Store) updateVerification(db execer, v Verification, from string) (Verification, error) {
 	sent, err := json.Marshal(attempts(v.SendAttempts))
 	if err != nil {
 		return Verification{}, err
 	}
 	res, err := db.Exec(`UPDATE verifications SET channel = ?, code = ?, status = ?, send_attempts = ?,
-		check_attempts = ?, expires_at = ?, updated_at = ? WHERE id = ?`,
+		check_attempts = ?, expires_at = ?, updated_at = ? WHERE id = ? AND status = ?`,
 		v.Channel, v.Code, v.Status, string(sent), v.CheckAttempts, stamp(v.ExpiresAt).UnixNano(),
-		stamp(s.now()).UnixNano(), v.ID)
+		stamp(s.now()).UnixNano(), v.ID, from)
 	if err != nil {
 		return Verification{}, err
 	}
-	if n, err := res.RowsAffected(); err != nil {
+	n, err := res.RowsAffected()
+	if err != nil {
 		return Verification{}, err
-	} else if n == 0 {
-		return Verification{}, ErrNotFound
+	}
+	if n == 0 {
+		// Gone, or no longer in the status the caller read.
+		if _, err := readVerification(db, v.ID); err != nil {
+			return Verification{}, err
+		}
+		return Verification{}, ErrStale
 	}
 	return readVerification(db, v.ID)
 }
@@ -148,8 +160,10 @@ func (s *Store) updateVerification(db execer, v Verification) (Verification, err
 // SendVerification stores one send of a verification's code in a single
 // transaction: v is added (isNew) or updated as AddVerification or
 // UpdateVerification would, and m, the message carrying the code, is added
-// as Add would. When either write fails, neither is stored and nothing is
-// published.
+// as Add would. A resend does not change the status, so its update is
+// conditional on the stored status still being v.Status, and returns
+// ErrStale when it is not. When either write fails, neither is stored and
+// nothing is published.
 func (s *Store) SendVerification(v Verification, isNew bool, m Message) (Verification, Message, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -159,7 +173,7 @@ func (s *Store) SendVerification(v Verification, isNew bool, m Message) (Verific
 	if isNew {
 		v, err = s.insertVerification(tx, v)
 	} else {
-		v, err = s.updateVerification(tx, v)
+		v, err = s.updateVerification(tx, v, v.Status)
 	}
 	if err != nil {
 		return Verification{}, Message{}, err
