@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bufio"
 	"crypto/x509"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -252,5 +254,52 @@ func TestGuardExemptsProxiedRequests(t *testing.T) {
 	}
 	if got, err := st.List(store.Filter{}); err != nil || len(got) != 3 {
 		t.Fatalf("captured %d messages through the proxy, want 3 (%v)", len(got), err)
+	}
+}
+
+func TestSplitHosts(t *testing.T) {
+	got := SplitHosts(" caduceus, sms.test ,, ,LAN.example:8026")
+	want := []string{"caduceus", "sms.test", "LAN.example:8026"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("SplitHosts = %q, want %q", got, want)
+	}
+	if got := SplitHosts(""); len(got) != 0 {
+		t.Fatalf("SplitHosts(\"\") = %q, want none", got)
+	}
+}
+
+// Each name of a spaced -allowed-hosts list is answered.
+func TestGuardAllowsEachListedHost(t *testing.T) {
+	_, ts := guardedServer(t, Options{AllowedHosts: SplitHosts("caduceus, sms.test")})
+	for _, host := range []string{"caduceus:8026", "sms.test:8026"} {
+		if status, body := guardReq(t, ts, http.MethodGet, "/api/v1/messages", host, nil, nil); status != http.StatusOK {
+			t.Errorf("Host %s answered %d %s, want 200", host, status, body)
+		}
+	}
+}
+
+// A request without a Host is refused, even when an allowed-hosts entry
+// reduces to an empty name.
+func TestGuardRefusesEmptyHost(t *testing.T) {
+	for _, extra := range [][]string{nil, {"", " ", ":8026", "[]"}} {
+		_, ts := guardedServer(t, Options{AllowedHosts: extra})
+		// HTTP/1.0 lets a request omit Host; Go's client always sends one.
+		conn, err := net.Dial("tcp", strings.TrimPrefix(ts.URL, "http://"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(conn, "GET /api/v1/messages HTTP/1.0\r\n\r\n"); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		conn.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("empty Host with AllowedHosts %q answered %d %s, want 403", extra, resp.StatusCode, body)
+		}
 	}
 }
