@@ -22,6 +22,11 @@ const (
 
 var ErrNotFound = errors.New("not found")
 
+// ErrStale reports a conditional write that found its row with a status other
+// than the one its caller read: the row changed since that read, and the write
+// changed nothing.
+var ErrStale = errors.New("changed since it was read")
+
 const schema = `
 CREATE TABLE IF NOT EXISTS messages (
 	seq              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,6 +150,13 @@ func Open(path string, max int) (*Store, error) {
 		return nil, err
 	}
 	return &Store{db: db, max: max, temp: temp, now: time.Now, subs: map[chan Event]struct{}{}}, nil
+}
+
+// SetClock replaces the store's clock, which stamps writes and decides
+// expiry. It is a test seam and is not synchronised: call it before the store
+// is in use.
+func (s *Store) SetClock(now func() time.Time) {
+	s.now = now
 }
 
 // migrate brings a messages table created before verifications existed up to

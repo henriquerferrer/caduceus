@@ -131,8 +131,9 @@ func newVerification(t *testing.T, s *Store, service, to string) Verification {
 
 func setStatus(t *testing.T, s *Store, v Verification, status string) Verification {
 	t.Helper()
+	from := v.Status
 	v.Status = status
-	v, err := s.UpdateVerification(v)
+	v, err := s.UpdateVerification(v, from)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +186,7 @@ func TestVerificationRoundTripsAcrossReopen(t *testing.T) {
 	want.SendAttempts = append(want.SendAttempts, SendAttempt{SID: NewSID("VL"), Channel: "call", Time: time.Unix(1_800_000_000, 5).UTC()})
 	want.Channel = "call"
 	want.Code = "654321"
-	updated, err := s.UpdateVerification(want)
+	updated, err := s.UpdateVerification(want, "pending")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +243,7 @@ func TestPendingVerificationScoping(t *testing.T) {
 	if _, err := s.GetVerification("VEnope"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing: err = %v", err)
 	}
-	if _, err := s.UpdateVerification(Verification{ID: "VEnope"}); !errors.Is(err, ErrNotFound) {
+	if _, err := s.UpdateVerification(Verification{ID: "VEnope"}, "pending"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("update missing: err = %v", err)
 	}
 }
@@ -258,25 +259,25 @@ func TestPendingVerificationExpiresOnRead(t *testing.T) {
 
 	atNow := newVerification(t, s, "VAone", "+15551234567")
 	atNow.ExpiresAt = now // equal to now: expired
-	atNow, err = s.UpdateVerification(atNow)
+	atNow, err = s.UpdateVerification(atNow, "pending")
 	if err != nil {
 		t.Fatal(err)
 	}
 	before := newVerification(t, s, "VAone", "+15550000000")
 	before.ExpiresAt = now.Add(-time.Second)
-	before, err = s.UpdateVerification(before)
+	before, err = s.UpdateVerification(before, "pending")
 	if err != nil {
 		t.Fatal(err)
 	}
 	approved := setStatus(t, s, newVerification(t, s, "VAone", "+15559999999"), "approved")
 	approved.ExpiresAt = now.Add(-time.Hour)
-	approved, err = s.UpdateVerification(approved)
+	approved, err = s.UpdateVerification(approved, "approved")
 	if err != nil {
 		t.Fatal(err)
 	}
 	live := newVerification(t, s, "VAone", "+15558888888")
 	live.ExpiresAt = now.Add(time.Nanosecond)
-	live, err = s.UpdateVerification(live)
+	live, err = s.UpdateVerification(live, "pending")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +325,7 @@ func TestPendingVerificationExpiresOnRead(t *testing.T) {
 
 	expiring := newVerification(t, s, "VAone", "+15557777777")
 	expiring.ExpiresAt = now.Add(-time.Minute)
-	if _, err := s.UpdateVerification(expiring); err != nil {
+	if _, err := s.UpdateVerification(expiring, "pending"); err != nil {
 		t.Fatal(err)
 	}
 	nextVerificationEvent(t, events) // add
@@ -353,13 +354,13 @@ func TestExpiryDoesNotOverwriteConcurrentWrite(t *testing.T) {
 
 	v := newVerification(t, s, "VAone", "+15551234567")
 	v.ExpiresAt = now.Add(-time.Second)
-	stale, err := s.UpdateVerification(v)
+	stale, err := s.UpdateVerification(v, "pending")
 	if err != nil {
 		t.Fatal(err)
 	}
 	current := stale
 	current.Status, current.CheckAttempts = "approved", 1
-	if _, err := s.UpdateVerification(current); err != nil {
+	if _, err := s.UpdateVerification(current, "pending"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -370,6 +371,53 @@ func TestExpiryDoesNotOverwriteConcurrentWrite(t *testing.T) {
 		t.Fatalf("got %+v, %v", got, err)
 	}
 	noEvent(t, events)
+}
+
+// A write conditioned on the status its caller read does not overwrite a
+// status stored since: against an expired row, an update conditioned on
+// pending and a resend of the pending verification return ErrStale, change
+// nothing and publish nothing.
+func TestVerificationWriteIsConditionalOnReadStatus(t *testing.T) {
+	s, err := Open("", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Unix(1_800_000_000, 0).UTC()
+	s.SetClock(func() time.Time { return now })
+
+	read := newVerification(t, s, "VAone", "+15551234567")
+	now = read.ExpiresAt
+	expired, err := s.GetVerification(read.ID)
+	if err != nil || expired.Status != "expired" {
+		t.Fatalf("expired: got %+v, %v", expired, err)
+	}
+	now = now.Add(time.Second)
+
+	events, cancel := s.Subscribe()
+	defer cancel()
+	approved := read
+	approved.Status, approved.CheckAttempts = "approved", 1
+	if got, err := s.UpdateVerification(approved, "pending"); !errors.Is(err, ErrStale) {
+		t.Fatalf("update: got %+v, %v; want ErrStale", got, err)
+	}
+	resend := read
+	resend.SendAttempts = append(resend.SendAttempts, SendAttempt{SID: NewSID("VL"), Channel: "sms", Time: now})
+	m := Message{ID: NewSID("SM"), Direction: Outbound, To: read.To, Body: read.Code, OTP: read.Code, Status: "queued", VerificationSID: read.ID}
+	if _, _, err := s.SendVerification(resend, false, m); !errors.Is(err, ErrStale) {
+		t.Fatalf("resend: err = %v; want ErrStale", err)
+	}
+	noEvent(t, events)
+
+	if stored, err := s.getVerification(read.ID); err != nil || !reflect.DeepEqual(stored, expired) {
+		t.Fatalf("row changed: got %+v, %v; want %+v", stored, err, expired)
+	}
+	if msgs, err := s.List(Filter{}); err != nil || len(msgs) != 0 {
+		t.Fatalf("stale resend stored messages %+v, %v", msgs, err)
+	}
+	if _, err := s.UpdateVerification(Verification{ID: "VEnope"}, "pending"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("update missing: err = %v; want ErrNotFound", err)
+	}
 }
 
 // deleteOnFirstNow makes the store's clock delete the verification with that
@@ -403,7 +451,7 @@ func TestReadsSkipVerificationDeletedBeforeExpiry(t *testing.T) {
 	older := newVerification(t, s, "VAone", "+15551234567")
 	newer := newVerification(t, s, "VAone", "+15551234567")
 	newer.ExpiresAt = now.Add(-time.Second)
-	if _, err := s.UpdateVerification(newer); err != nil {
+	if _, err := s.UpdateVerification(newer, "pending"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -415,7 +463,7 @@ func TestReadsSkipVerificationDeletedBeforeExpiry(t *testing.T) {
 
 	gone := newVerification(t, s, "VAone", "+15551234567")
 	gone.ExpiresAt = now.Add(-time.Second)
-	if _, err := s.UpdateVerification(gone); err != nil {
+	if _, err := s.UpdateVerification(gone, "pending"); err != nil {
 		t.Fatal(err)
 	}
 	deleteOnFirstNow(t, s, now, gone.ID)
@@ -473,7 +521,7 @@ func TestVerificationWritesPublishEvents(t *testing.T) {
 		t.Fatalf("add event %+v, want %+v", e, v)
 	}
 	v.CheckAttempts = 1
-	v, err = s.UpdateVerification(v)
+	v, err = s.UpdateVerification(v, "pending")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -12,7 +12,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1053,7 +1055,7 @@ func TestVerifyCheckExpired(t *testing.T) {
 		t.Fatal(err)
 	}
 	stored.ExpiresAt = time.Now().Add(-time.Minute)
-	if _, err := st.UpdateVerification(stored); err != nil {
+	if _, err := st.UpdateVerification(stored, "pending"); err != nil {
 		t.Fatal(err)
 	}
 	for _, form := range []url.Values{{"To": {to}, "Code": {code}}, {"VerificationSid": {sid}, "Code": {code}}} {
@@ -1238,6 +1240,224 @@ func TestAPIExpireWaitsForVerifyMutations(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("expire did not finish after verifyMu was released")
+	}
+}
+
+// pausingClock is a store clock reading a settable time. Once armed, its next
+// call pauses until released, then returns the time it read before pausing.
+type pausingClock struct {
+	mu      sync.Mutex
+	now     time.Time
+	armed   bool
+	paused  chan struct{}
+	release chan struct{}
+}
+
+func (c *pausingClock) Now() time.Time {
+	c.mu.Lock()
+	now, armed, paused, release := c.now, c.armed, c.paused, c.release
+	c.armed = false
+	c.mu.Unlock()
+	if armed {
+		close(paused)
+		<-release
+	}
+	return now
+}
+
+func (c *pausingClock) set(now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = now
+}
+
+// arm pauses the clock's next call: paused is closed when that call pauses,
+// and the call returns once release is called.
+func (c *pausingClock) arm() (paused <-chan struct{}, release func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.armed = true
+	c.paused, c.release = make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	ch := c.release
+	return c.paused, func() { once.Do(func() { close(ch) }) }
+}
+
+// A Verify write does not overwrite an expiry stored after the handler read
+// the verification. The handler is paused at its first clock call, the expiry
+// check of its read; in that window the TTL ends and the REST read, which does
+// not take verifyMu, stores expired. Once released, the handler answers from
+// the current state and the verification stays expired.
+func TestVerifyWriteKeepsExpiryStoredAfterItsRead(t *testing.T) {
+	const to = "+15550005551"
+	notFound := func(t *testing.T, status int, body map[string]any, _ string) {
+		t.Helper()
+		wantTwilioError(t, status, body, http.StatusNotFound, 20404)
+	}
+	cases := []struct {
+		name        string
+		wrongChecks int // checks with a wrong code before the window
+		method      string
+		path        func(base, sid string) string
+		form        func(sid, code string) url.Values
+		want        func(t *testing.T, status int, body map[string]any, sid string)
+	}{
+		{
+			name: "check right code", method: http.MethodPost,
+			path: func(base, _ string) string { return checkURL(base, "VAx") },
+			form: func(sid, code string) url.Values { return url.Values{"VerificationSid": {sid}, "Code": {code}} },
+			want: notFound,
+		},
+		{
+			name: "check wrong code", method: http.MethodPost,
+			path: func(base, _ string) string { return checkURL(base, "VAx") },
+			form: func(_, code string) url.Values { return url.Values{"To": {to}, "Code": {wrongCode(code)}} },
+			want: notFound,
+		},
+		{
+			name: "check reaching the attempt limit", wrongChecks: store.MaxCheckAttempts, method: http.MethodPost,
+			path: func(base, _ string) string { return checkURL(base, "VAx") },
+			form: func(_, code string) url.Values { return url.Values{"To": {to}, "Code": {code}} },
+			want: notFound,
+		},
+		{
+			name: "update to approved", method: http.MethodPost,
+			path: func(base, sid string) string { return verificationsURL(base, "VAx") + "/" + sid },
+			form: func(string, string) url.Values { return url.Values{"Status": {"approved"}} },
+			want: notFound,
+		},
+		{
+			name: "resend on start", method: http.MethodPost,
+			path: func(base, _ string) string { return verificationsURL(base, "VAx") },
+			form: func(string, string) url.Values { return url.Values{"To": {to}, "Channel": {"sms"}} },
+			want: func(t *testing.T, status int, body map[string]any, sid string) {
+				t.Helper()
+				if status != http.StatusCreated || body["sid"] == sid || body["status"] != "pending" {
+					t.Fatalf("got %d %v, want 201 with a new pending verification", status, body)
+				}
+			},
+		},
+		{
+			name: "expire hook", method: http.MethodPost,
+			path: func(base, sid string) string { return base + "/api/v1/verifications/" + sid + "/expire" },
+			form: func(string, string) url.Values { return nil },
+			want: func(t *testing.T, status int, body map[string]any, _ string) {
+				t.Helper()
+				if status != http.StatusConflict || body["error"] == nil {
+					t.Fatalf("got %d %v, want 409", status, body)
+				}
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			st := newStore(t)
+			clock := &pausingClock{now: time.Now().UTC()}
+			st.SetClock(clock.Now)
+			srv := New(st, Options{})
+			ts := httptest.NewServer(srv)
+			t.Cleanup(ts.Close)
+
+			_, started := startVerification(t, ts.URL, "VAx", url.Values{"To": {to}, "Channel": {"sms"}})
+			sid := started["sid"].(string)
+			code := sentCode(t, st, to)
+			for i := range c.wrongChecks {
+				if status, got := checkVerification(t, http.DefaultClient, ts.URL, "VAx", url.Values{"To": {to}, "Code": {wrongCode(code)}}); status != http.StatusOK {
+					t.Fatalf("wrong check %d: %d %v", i+1, status, got)
+				}
+			}
+			read, err := st.GetVerification(sid)
+			if err != nil || read.Status != "pending" {
+				t.Fatalf("before the window: %+v, %v", read, err)
+			}
+			clock.set(read.ExpiresAt.Add(-time.Millisecond))
+			events, cancel := st.Subscribe()
+			defer cancel()
+
+			type response struct {
+				status int
+				body   map[string]any
+			}
+			done := make(chan response, 1)
+			paused, release := clock.arm()
+			defer release() // a failed assertion must not leave the handler paused
+			go func() {
+				// No t.Fatal off the test goroutine: report and send a zero response.
+				var r response
+				form := c.form(sid, code)
+				req, err := http.NewRequest(c.method, c.path(ts.URL, sid), strings.NewReader(form.Encode()))
+				if err != nil {
+					t.Error(err)
+					done <- r
+					return
+				}
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				req.SetBasicAuth("ACtest", "secret")
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Error(err)
+					done <- r
+					return
+				}
+				defer resp.Body.Close()
+				r.status = resp.StatusCode
+				if err := json.NewDecoder(resp.Body).Decode(&r.body); err != nil {
+					t.Error(err)
+				}
+				done <- r
+			}()
+			select {
+			case <-paused:
+			case r := <-done:
+				t.Fatalf("handler answered %d %v without pausing at its read", r.status, r.body)
+			case <-time.After(5 * time.Second):
+				t.Fatal("handler did not reach its read")
+			}
+			if srv.verifyMu.TryLock() {
+				srv.verifyMu.Unlock()
+				t.Fatal("handler paused at its read without holding verifyMu")
+			}
+
+			clock.set(read.ExpiresAt.Add(time.Millisecond))
+			var got store.Verification
+			if status := apiJSON(t, http.MethodGet, ts.URL+"/api/v1/verifications/"+sid, &got); status != http.StatusOK || got.Status != "expired" {
+				t.Fatalf("REST read in the window: %d %+v", status, got)
+			}
+			release()
+			var r response
+			select {
+			case r = <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("handler did not answer after its release")
+			}
+
+			got = store.Verification{}
+			if status := apiJSON(t, http.MethodGet, ts.URL+"/api/v1/verifications/"+sid, &got); status != http.StatusOK || got.Status != "expired" {
+				t.Fatalf("afterwards: %d %+v, want expired", status, got)
+			}
+			var statuses []string
+		drain:
+			for {
+				select {
+				case e := <-events:
+					if e.Type == "verification" && e.Verification.ID == sid {
+						statuses = append(statuses, e.Verification.Status)
+					}
+				default:
+					break drain
+				}
+			}
+			first := slices.Index(statuses, "expired")
+			if first < 0 {
+				t.Fatalf("events %v: none is expired", statuses)
+			}
+			for _, s := range statuses[first:] {
+				if s != "expired" {
+					t.Fatalf("events %v: %q published after expired", statuses, s)
+				}
+			}
+			c.want(t, r.status, r.body, sid)
+		})
 	}
 }
 
