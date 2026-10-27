@@ -28,6 +28,12 @@ type instance struct {
 // start builds the binary once per test and runs it on a free port.
 func start(t *testing.T) instance {
 	t.Helper()
+	return startWithEnv(t)
+}
+
+// startWithEnv is start with extra environment variables, as KEY=value.
+func startWithEnv(t *testing.T, env ...string) instance {
+	t.Helper()
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "caduceus")
 	build := exec.Command("go", "build", "-o", bin, "../cmd/caduceus")
@@ -44,6 +50,7 @@ func start(t *testing.T) instance {
 
 	data := filepath.Join(dir, "data")
 	cmd := exec.Command(bin, "-listen", addr, "-data-dir", data, "-delivery-delay", "-1s")
+	cmd.Env = append(os.Environ(), env...)
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -219,6 +226,31 @@ func TestTwilioNodeSDKVerify(t *testing.T) {
 	got := verifyNode(t, c, "check", to, code)
 	if e, _ := got["restException"].(map[string]any); e == nil || e["status"] != float64(404) || e["code"] != float64(20404) {
 		t.Fatalf("check after approval = %v, want a RestException 404 / 20404", got)
+	}
+}
+
+// An app container that calls Caduceus by its Compose service name is
+// answered only once that name is allowed.
+func TestAllowedHostsOption(t *testing.T) {
+	get := func(c instance) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, c.base+"/api/v1/messages", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = "caduceus"
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if got := get(startWithEnv(t, "CADUCEUS_ALLOWED_HOSTS=caduceus")); got != http.StatusOK {
+		t.Errorf("with CADUCEUS_ALLOWED_HOSTS=caduceus: status %d, want 200", got)
+	}
+	if got := get(startWithEnv(t, "CADUCEUS_ALLOWED_HOSTS=")); got != http.StatusForbidden {
+		t.Errorf("without CADUCEUS_ALLOWED_HOSTS: status %d, want 403", got)
 	}
 }
 

@@ -31,8 +31,12 @@ type Options struct {
 	InboundWebhook string
 	// CA enables proxy mode: with it, Caduceus answers HTTPS proxy requests
 	// for provider hosts itself.
-	CA     *CA
-	Logger *slog.Logger
+	CA *CA
+	// AllowedHosts are host names, beyond localhost, 127.0.0.1 and ::1, that
+	// requests to the UI, API and base-URL provider routes may name in their
+	// Host header. A port on an entry is ignored.
+	AllowedHosts []string
+	Logger       *slog.Logger
 }
 
 type Server struct {
@@ -60,6 +64,9 @@ type Server struct {
 	// direct reaches real servers for proxied traffic Caduceus doesn't capture.
 	direct    *http.Transport
 	tunnelled *connListener
+	// allowed holds the names, as hostName returns them, that requests to the
+	// local listener may carry in their Host header.
+	allowed map[string]bool
 }
 
 func New(st *store.Store, opts Options) *Server {
@@ -72,6 +79,7 @@ func New(st *store.Store, opts Options) *Server {
 		messaging: http.NewServeMux(),
 		verify:    http.NewServeMux(),
 		direct:    &http.Transport{},
+		allowed:   allowedHosts(opts.AllowedHosts),
 	}
 	if s.log == nil {
 		s.log = slog.Default()
@@ -127,6 +135,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// A plain-HTTP proxy request: never the Caduceus API or UI.
 		s.serveProvider(w, r, r.URL.Hostname(), s.forward)
 	default:
+		// The UI, the REST API and the base-URL provider routes.
+		if msg := s.refusal(r); msg != "" {
+			s.refuse(w, r, msg)
+			return
+		}
 		s.mux.ServeHTTP(w, r)
 	}
 }

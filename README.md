@@ -108,6 +108,22 @@ Each captured message moves from `queued` to `sent` to `delivered`, and Caduceus
 | `-max-messages` | | `5000` | Messages kept before the oldest are dropped (0 keeps all); also caps Verify verifications, counted separately |
 | `-delivery-delay` | | `1s` | Pause before each simulated status change; negative disables |
 | `-inbound-webhook` | `CADUCEUS_INBOUND_WEBHOOK` | | Default URL for simulated inbound messages |
+| `-allowed-hosts` | `CADUCEUS_ALLOWED_HOSTS` | | Comma-separated host names, beyond `localhost`, `127.0.0.1` and `::1`, that the UI, API and provider endpoints answer; a port on an entry is ignored |
+
+The UI, the REST API and the provider endpoints refuse, with `403`, a request whose `Host` is not an allowed name, and a browser request from another origin (an `Origin` other than Caduceus's own, or `Sec-Fetch-Site: cross-site` or `same-site`; following a link to the inbox still opens it). This guards against a web page you visit reading captured codes or acting on them. Requests through the proxy are not affected.
+
+Under Docker Compose, an app container that calls Caduceus by its service name must allow that name:
+
+```yaml
+services:
+  caduceus:
+    build: .
+    environment:
+      CADUCEUS_ALLOWED_HOSTS: caduceus
+  app:
+    environment:
+      CADUCEUS_URL: http://caduceus:8026   # where your tests read messages
+```
 
 ## Storage
 

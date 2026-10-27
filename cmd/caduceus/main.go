@@ -38,6 +38,7 @@ func main() {
 	maxMessages := flag.Int("max-messages", 5000, "messages, and separately verifications, to keep before the oldest are dropped (0 = unlimited)")
 	delay := flag.Duration("delivery-delay", time.Second, "pause before each simulated status change; negative disables")
 	inbound := flag.String("inbound-webhook", env("CADUCEUS_INBOUND_WEBHOOK", ""), "URL that receives simulated inbound messages")
+	allowedHosts := flag.String("allowed-hosts", env("CADUCEUS_ALLOWED_HOSTS", ""), "comma-separated host names, beyond localhost, 127.0.0.1 and ::1, that the UI, API and provider endpoints answer, e.g. a Docker Compose service name")
 	dataDir := flag.String("data-dir", env("CADUCEUS_DATA_DIR", defaultDataDir()), "directory for the proxy CA certificate")
 	flag.Parse()
 
@@ -59,6 +60,7 @@ func main() {
 			DeliveryDelay:  *delay,
 			InboundWebhook: *inbound,
 			CA:             ca,
+			AllowedHosts:   server.SplitHosts(*allowedHosts),
 		}),
 	}
 
