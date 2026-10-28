@@ -1354,7 +1354,9 @@ func TestVerifyWriteKeepsExpiryStoredAfterItsRead(t *testing.T) {
 			st := newStore(t)
 			clock := &pausingClock{now: time.Now().UTC()}
 			st.SetClock(clock.Now)
-			srv := New(st, Options{})
+			// Delivery off: its goroutine reads the store clock outside
+			// verifyMu and could take the pause meant for the handler.
+			srv := New(st, Options{DeliveryDelay: -1})
 			ts := httptest.NewServer(srv)
 			t.Cleanup(ts.Close)
 

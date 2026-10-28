@@ -19,8 +19,12 @@ typecheck:
     go test -tags e2e -count=1 -run '^$' ./... > /dev/null
 
 # Unit + integration tests. A separate `e2e` recipe below covers end-to-end.
+# Twice: the race detector slows every goroutine, so a test that only holds
+# its timing under -race passes there and fails at full speed. The second
+# pass runs at full speed in shuffled order.
 test *args:
     go test -race -count=1 ./... {{ args }}
+    go test -count=1 -shuffle=on ./... {{ args }}
 
 # Builds the binary and drives it through the HTTPS proxy, including with the
 # stock twilio Node SDK, and drives the inbox UI in headless Chromium. Needs
